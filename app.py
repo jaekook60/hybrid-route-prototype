@@ -16,7 +16,7 @@ st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layou
 MAX_TRANSIT_PATHS = 4
 MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
-MAX_INTERMEDIATE_CANDIDATES = 12
+MAX_INTERMEDIATE_CANDIDATES = 30
 DIRECT_STOP_WALK_MIN = 3
 DIRECT_STOP_EXTRA_FARE_ALLOW = 3000
 MIN_TAXI_MIN = 4
@@ -30,7 +30,7 @@ PARALLEL_WORKERS = 6
 # 사전 필터 (Haversine)
 PREFILTER_MIN_KM = 1.0            # 출발지에서 1km 미만 후보 제외
 PREFILTER_MAX_RATIO = 0.80        # 총 거리의 80% 넘으면 제외
-PREFILTER_TOP_N = 8               # 사전 필터 후 상위 N개만 API 호출
+PREFILTER_TOP_N = 8     20         # 사전 필터 후 상위 N개만 API 호출
 
 # 버스 실시간 반영
 REALTIME_BUS_ENABLED = True
@@ -62,7 +62,7 @@ MIXED_NEAR_TAXI_MIN_COST_SAVE = 5000
 MIXED_NEAR_TAXI_MIN_TIME_SAVE = 6
 MIXED_KEEP_TIME_SAVE_VS_TRANSIT_ABS = 10
 MIXED_KEEP_TIME_SAVE_VS_TRANSIT_RATIO = 0.20
-MIXED_MAX_EXTRA_COST_VS_TRANSIT = 20000
+MIXED_MAX_EXTRA_COST_VS_TRANSIT = 25000
 MIXED_HIGH_TAXI_SHARE = 0.75
 MIXED_HIGH_TAXI_KM = 20.0
 
@@ -1027,21 +1027,23 @@ def collect_subpath_points(sp):
 
 
 # =========================================================
-# 후보 지점 추출 (균등 할당 + Haversine 사전 필터)
+# 후보 지점 추출 (지하철 VIP 우대 + Haversine 사전 필터)
 # =========================================================
 def _collect_raw_points(paths, reference, exclude_point):
-    """경로들에서 대중교통 정류장/역 좌표를 모두 수집 (경로별 균등)."""
-    per_path_limit = max(3, MAX_INTERMEDIATE_CANDIDATES // min(len(paths), MAX_TRANSIT_PATHS))
+    """경로들에서 대중교통 정류장/역 좌표를 수집 (지하철역 플래그 추가)"""
     candidates = []
     seen = set()
 
     for path in paths[:MAX_TRANSIT_PATHS]:
         if not isinstance(path, dict):
             continue
-        path_points = []
         for sp in path.get("subPath", []):
-            if not isinstance(sp, dict) or sp.get("trafficType") not in (1, 2):
+            tt = sp.get("trafficType")
+            if tt not in (1, 2):
                 continue
+            
+            is_subway = (tt == 1)  # 🚇 여기가 핵심! 현재 노드가 지하철인지 확인
+
             for p in collect_subpath_points(sp):
                 if is_same_point(p["x"], p["y"], exclude_point["x"], exclude_point["y"]):
                     continue
@@ -1049,18 +1051,15 @@ def _collect_raw_points(paths, reference, exclude_point):
                 if key in seen:
                     continue
                 seen.add(key)
-                d = haversine_km(reference["x"], reference["y"], p["x"], p["y"])
-                path_points.append((d, p))
-
-        path_points.sort(key=lambda x: x[0])
-        for _, p in path_points[:per_path_limit]:
-            candidates.append(p)
+                
+                p["is_subway"] = is_subway  # 정류장 데이터에 '지하철역 VIP 태그' 달아주기
+                candidates.append(p)
 
     return candidates[:MAX_INTERMEDIATE_CANDIDATES]
 
 
 def prefilter_candidates(candidates, reference, total_dist_km, is_board=True):
-    """Haversine 사전 필터: 너무 가깝거나 너무 먼 후보 제거."""
+    """Haversine 사전 필터: 너무 가깝거나 멀면 제거 + 지하철역 무조건 우대"""
     filtered = []
     for c in candidates:
         d = haversine_km(reference["x"], reference["y"], c["x"], c["y"])
@@ -1068,7 +1067,10 @@ def prefilter_candidates(candidates, reference, total_dist_km, is_board=True):
             continue
         if d > total_dist_km * PREFILTER_MAX_RATIO:
             continue
-        filtered.append((d, c))
+        
+        # 🔥 핵심 로직: 지하철역(VIP)이면 거리를 10분의 1로 취급해서 무조건 후보 상위권에 랭크시킴
+        sort_d = d * 0.1 if c.get("is_subway") else d
+        filtered.append((sort_d, c))
 
     filtered.sort(key=lambda x: x[0])
     return [c for _, c in filtered[:PREFILTER_TOP_N]]
