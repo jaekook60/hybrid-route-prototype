@@ -9,10 +9,10 @@ st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layou
 # =========================================================
 # 설정
 # =========================================================
-MAX_TRANSIT_PATHS = 6
+MAX_TRANSIT_PATHS = 4
 MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
-MAX_INTERMEDIATE_CANDIDATES = 40
+MAX_INTERMEDIATE_CANDIDATES = 12
 # 너무 짧은 택시 구간 제거
 MIN_TAXI_MIN = 4
 MIN_TAXI_KM = 1.5
