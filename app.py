@@ -1553,10 +1553,19 @@ def pick_best(candidates, priority, arrive_by=None):
     def ontime_key(c):
         if not c["late"]:
             return (0, c["time_min"], c["cost"])
-        return (1, abs(c["late_diff"]) if c["late_diff"] is not None else 999999, c["time_min"], c["cost"])
+        return (
+            1,
+            abs(c["late_diff"]) if c["late_diff"] is not None else 999999,
+            c["time_min"],
+            c["cost"],
+        )
 
-   def value_key(c):
-    return (value_score(c, candidates, arrive_by=arrive_by), c["cost"], c["time_min"])
+    def value_key(c):
+        return (
+            value_score(c, candidates, arrive_by=arrive_by),
+            c["cost"],
+            c["time_min"],
+        )
 
     if priority == "최저비용":
         return sorted(candidates, key=cost_key)[0]
@@ -1570,7 +1579,7 @@ def pick_best_by_kind(candidates, kind, priority, arrive_by=None):
     subset = [c for c in candidates if c["kind"] == kind]
     if not subset:
         return None
-    return pick_best(subset, priority, arrive_by=arrive_by))
+    return pick_best(subset, priority, arrive_by=arrive_by)
 
 
 # =========================================================
