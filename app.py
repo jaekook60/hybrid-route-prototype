@@ -1055,48 +1055,26 @@ def build_route_candidates(origin, destination, arrive_by):
 # 정렬 / 추천
 # =========================================================
 def value_score(c, candidates):
-    # 1. 비선형 스케일링 (비용 왜곡 방지)
-    # 택시비(예: 2만원)가 대중교통(예: 1500원)보다 압도적으로 커서 생기는 스케일 왜곡을
-    # 제곱근(sqrt)을 씌워 완화해 줍니다.
-    costs = [math.sqrt(x["cost"]) for x in candidates]
+    costs = [x["cost"] for x in candidates]
     times = [x["time_min"] for x in candidates]
 
     min_cost, max_cost = min(costs), max(costs)
     min_time, max_time = min(times), max(times)
 
-    current_cost = math.sqrt(c["cost"])
-    cost_norm = 0 if max_cost == min_cost else (current_cost - min_cost) / (max_cost - min_cost)
-    time_norm = 0 if max_time == min_time else (c["time_min"] - min_time) / (max_time - min_time)
-
-    # 2. 동적 가중치 완화 (극단점 회피)
-    # 0.9 / 0.1 처럼 극단으로 보내지 않고, 하한선(0.2)과 상한선(0.8)을 두어 
-    # 항상 양쪽 변수를 어느 정도 고려하도록 만듭니다.
-    slack_min = c.get("late_diff")
-    if slack_min is None:
-        dynamic_time_weight = VALUE_TIME_WEIGHT
+    if max_cost == min_cost:
+        cost_norm = 0
     else:
-        if slack_min >= 60:
-            dynamic_time_weight = 0.2  
-        elif slack_min <= 10:
-            dynamic_time_weight = 0.8  
-        else:
-            dynamic_time_weight = 0.8 - 0.6 * ((slack_min - 10) / 50)
-            
-    dynamic_cost_weight = 1.0 - dynamic_time_weight
+        cost_norm = (c["cost"] - min_cost) / (max_cost - min_cost)
 
-    # 3. 혼합 경로 강력한 인센티브 (음수 페널티)
+    if max_time == min_time:
+        time_norm = 0
+    else:
+        time_norm = (c["time_min"] - min_time) / (max_time - min_time)
+
     late_penalty = 1 if c["late"] else 0
-    
-    kind_penalty = 0
-    if c["kind"] == "taxi":
-        kind_penalty = 0.15          # 택시는 가성비에서 페널티를 받음
-    elif c["kind"] == "transit":
-        kind_penalty = 0.05          # 대중교통도 약간의 기본 페널티
-    elif c["kind"] in ("mixed_first", "mixed_last"):
-        kind_penalty = -0.15         # ★ 혼합 경로에 점수 차감(보너스) 부여!
+    kind_penalty = VALUE_KIND_PENALTY.get(c["kind"], 0)
 
-    # 4. 최종 스코어 계산
-    score = late_penalty + kind_penalty + (dynamic_cost_weight * cost_norm) + (dynamic_time_weight * time_norm)
+    score = late_penalty + kind_penalty + (VALUE_COST_WEIGHT * cost_norm) + (VALUE_TIME_WEIGHT * time_norm)
     return score
 
 
