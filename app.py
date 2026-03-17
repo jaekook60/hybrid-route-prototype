@@ -238,7 +238,7 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
     r = requests.get(url, params=params, headers=headers, timeout=20)
     
     r.raise_for_status()
-    data = r.json()json()
+    data = r.json()
 
     err_msg = parse_odsay_error(data)
     if err_msg:
