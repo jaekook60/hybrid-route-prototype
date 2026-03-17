@@ -229,9 +229,16 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
         "output": "json",
     }
 
-    r = requests.get(url, params=params, timeout=20)
+    # 1. 👇 이 부분을 새로 추가해 (로컬 테스트용이면 localhost)
+    headers = {
+        "Referer": "http://localhost:8501" 
+    }
+
+    # 2. 👇 requests.get 안에 headers=headers 를 추가해
+    r = requests.get(url, params=params, headers=headers, timeout=20)
+    
     r.raise_for_status()
-    data = r.json()
+    data = r.json()json()
 
     err_msg = parse_odsay_error(data)
     if err_msg:
