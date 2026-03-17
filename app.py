@@ -231,7 +231,7 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
 
     # 1. 👇 이 부분을 새로 추가해 (로컬 테스트용이면 localhost)
     headers = {
-        "Referer": "hybrid-route-prototype-kmwass9s4mjky8yrgn78la.streamlit.app" 
+        "Referer": "https://hybrid-route-prototype-kmwass9s4mjky8yrgn78la.streamlit.app/" 
     }
 
     # 2. 👇 requests.get 안에 headers=headers 를 추가해
