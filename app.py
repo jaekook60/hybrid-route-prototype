@@ -1524,17 +1524,19 @@ def value_score(c, candidates, arrive_by=None):
     #    "여유가 충분한가"만 보고, 충분하면 비용 중심으로 비교
     urgency_values = []
     for x in candidates:
+        late_diff = x.get("late_diff")
         if x["late"]:
-            urgency = 1000 + abs(x["late_diff"]) if x["late_diff"] is not None else 1000
+            urgency = 1000 + abs(late_diff) if late_diff is not None else 1000
         else:
-            slack = max(0, x["diff_min"] if x["diff_min"] is not None else 0)
+            slack = max(0, late_diff if late_diff is not None else 0)
             urgency = max(0, ARRIVE_BUFFER_MIN - slack)
         urgency_values.append(urgency)
 
+    my_late_diff = c.get("late_diff")
     if c["late"]:
-        my_urgency = 1000 + abs(c["late_diff"]) if c["late_diff"] is not None else 1000
+        my_urgency = 1000 + abs(my_late_diff) if my_late_diff is not None else 1000
     else:
-        slack = max(0, c["diff_min"] if c["diff_min"] is not None else 0)
+        slack = max(0, my_late_diff if my_late_diff is not None else 0)
         my_urgency = max(0, ARRIVE_BUFFER_MIN - slack)
 
     urgency_norm = normalize_score(my_urgency, urgency_values)
