@@ -1,8 +1,11 @@
 import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import streamlit as st
 
 st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layout="wide")
@@ -14,13 +17,20 @@ MAX_TRANSIT_PATHS = 4
 MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
 MAX_INTERMEDIATE_CANDIDATES = 12
-DIRECT_STOP_WALK_MIN = 3          # 첫/마지막 도보가 3분 이상이면 직접 정류장 택시 검토
-DIRECT_STOP_EXTRA_FARE_ALLOW = 3000  # 시간이 더 좋아지면 3천원까지 추가 허용
-# 너무 짧은 택시 구간 제거
+DIRECT_STOP_WALK_MIN = 3
+DIRECT_STOP_EXTRA_FARE_ALLOW = 3000
 MIN_TAXI_MIN = 4
 MIN_TAXI_KM = 1.5
 MIN_TAXI_FARE = 5000
-ARRIVE_BUFFER_MIN = 15   # 15분 이상 여유 있으면 '충분히 제시간'으로 간주
+ARRIVE_BUFFER_MIN = 15
+
+# 병렬 처리
+PARALLEL_WORKERS = 6
+
+# 사전 필터 (Haversine)
+PREFILTER_MIN_KM = 1.0            # 출발지에서 1km 미만 후보 제외
+PREFILTER_MAX_RATIO = 0.80        # 총 거리의 80% 넘으면 제외
+PREFILTER_TOP_N = 8               # 사전 필터 후 상위 N개만 API 호출
 
 # 버스 실시간 반영
 REALTIME_BUS_ENABLED = True
@@ -42,24 +52,22 @@ VALUE_KIND_PENALTY = {
     "taxi": 0.12,
 }
 
+# 파레토 필터: 환승 1회당 시간 페널티 (분)
+TRANSFER_PENALTY_MIN = 3
+
 # =========================================================
 # 혼합 후보 필터 기준
 # =========================================================
-# 택시만이랑 거의 비슷한 혼합인데, 이점이 없으면 제거
-MIXED_NEAR_TAXI_MIN_COST_SAVE = 5000   # 택시만보다 최소 5천원은 싸야 의미 있음
-MIXED_NEAR_TAXI_MIN_TIME_SAVE = 6      # 택시만보다 최소 6분 빨라야 의미 있음
-
-# 대중교통보다 충분히 빨라지면 살림
-MIXED_KEEP_TIME_SAVE_VS_TRANSIT = 12
+MIXED_NEAR_TAXI_MIN_COST_SAVE = 5000
+MIXED_NEAR_TAXI_MIN_TIME_SAVE = 6
+MIXED_KEEP_TIME_SAVE_VS_TRANSIT_ABS = 10
+MIXED_KEEP_TIME_SAVE_VS_TRANSIT_RATIO = 0.20
 MIXED_MAX_EXTRA_COST_VS_TRANSIT = 20000
-
-# 혼합인데 택시 비중이 너무 큰 경우 "거의 택시만"으로 봄
 MIXED_HIGH_TAXI_SHARE = 0.75
 MIXED_HIGH_TAXI_KM = 20.0
 
 # =========================================================
 # ODsay Referer
-# 배포 주소가 바뀌면 여기만 바꿔
 # =========================================================
 ODSAY_REFERER = "https://hybrid-route-prototype-kmwass9s4mjky8yrgn78la.streamlit.app/"
 
@@ -75,12 +83,38 @@ ODSAY_API_KEY = st.secrets["ODSAY_API_KEY"]
 
 KST = ZoneInfo("Asia/Seoul")
 
+
 def now_kst():
     return datetime.now(KST)
+
+
+# =========================================================
+# Retry-enabled HTTP 세션
+# =========================================================
+def _create_session():
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_session = _create_session()
+
 
 # =========================================================
 # 공통 유틸
 # =========================================================
+def round_coord(v, decimals=6):
+    """캐시 히트율을 높이기 위한 좌표 반올림."""
+    return round(v, decimals)
+
 
 def make_point(name, x, y, walk_min=0):
     x = safe_float(x, None)
@@ -96,13 +130,8 @@ def make_point(name, x, y, walk_min=0):
 
 
 def get_first_boarding_stop(path):
-    """
-    경로 시작 부분에서 첫 대중교통 승차 정류장/역을 찾는다.
-    앞에 붙은 도보 시간도 같이 계산.
-    """
     if not isinstance(path, dict):
         return None
-
     subpaths = path.get("subPath", [])
     if not isinstance(subpaths, list):
         return None
@@ -111,31 +140,21 @@ def get_first_boarding_stop(path):
     for sp in subpaths:
         if not isinstance(sp, dict):
             continue
-
         tt = sp.get("trafficType")
         if tt == 3:
             leading_walk += safe_int(sp.get("sectionTime", 0))
             continue
-
         if tt in (1, 2):
             return make_point(
-                sp.get("startName"),
-                sp.get("startX"),
-                sp.get("startY"),
+                sp.get("startName"), sp.get("startX"), sp.get("startY"),
                 walk_min=leading_walk,
             )
-
     return None
 
 
 def get_last_alighting_stop(path):
-    """
-    경로 끝 부분에서 마지막 대중교통 하차 정류장/역을 찾는다.
-    뒤에 붙은 도보 시간도 같이 계산.
-    """
     if not isinstance(path, dict):
         return None
-
     subpaths = path.get("subPath", [])
     if not isinstance(subpaths, list):
         return None
@@ -144,37 +163,26 @@ def get_last_alighting_stop(path):
     for sp in reversed(subpaths):
         if not isinstance(sp, dict):
             continue
-
         tt = sp.get("trafficType")
         if tt == 3:
             trailing_walk += safe_int(sp.get("sectionTime", 0))
             continue
-
         if tt in (1, 2):
             return make_point(
-                sp.get("endName"),
-                sp.get("endX"),
-                sp.get("endY"),
+                sp.get("endName"), sp.get("endX"), sp.get("endY"),
                 walk_min=trailing_walk,
             )
-
     return None
 
 
 def should_replace_with_direct_stop(old_time, old_cost, new_time, new_cost):
-    """
-    직접 정류장까지 택시로 가는 새 해가 더 낫다고 볼지 판단
-    """
-    # 완전 우월
     if new_time <= old_time and new_cost <= old_cost:
         return True
-
-    # 시간 2분 이상 개선 + 비용 증가가 3천원 이하
     if new_time + 2 <= old_time and new_cost <= old_cost + DIRECT_STOP_EXTRA_FARE_ALLOW:
         return True
-
     return False
-    
+
+
 def kakao_headers():
     return {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
 
@@ -219,11 +227,31 @@ def first_non_none(d, keys, default=None):
     return default
 
 
+def haversine_km(x1, y1, x2, y2):
+    """경위도 → 직선 거리 (km). 사전 필터용."""
+    R = 6371.0
+    lat1, lat2 = math.radians(y1), math.radians(y2)
+    dlat = math.radians(y2 - y1)
+    dlon = math.radians(x2 - x1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(min(1.0, a)))
+
+
+def validate_korea_coords(x, y):
+    """대한민국 경위도 범위 대략 검증."""
+    if not (124.5 <= x <= 132.0 and 33.0 <= y <= 43.5):
+        raise ValueError(
+            f"좌표({x:.4f}, {y:.4f})가 대한민국 범위를 벗어남. 장소명을 더 구체적으로 입력해 주세요."
+        )
+
+
 def parse_arrive_by(arrive_by: str):
     if not arrive_by:
         return None
     try:
         hh, mm = map(int, arrive_by.strip().split(":"))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
         now = now_kst()
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target < now:
@@ -239,7 +267,6 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
         return {"text": "시간 비교 안 함", "late": False, "diff_min": None}
 
     now = now_kst()
-
     recommend_depart = target - timedelta(minutes=total_time_min)
     eta_if_leave_now = now + timedelta(minutes=total_time_min)
     diff_if_leave_now = math.floor((target - eta_if_leave_now).total_seconds() / 60)
@@ -251,7 +278,6 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
             "late": False,
             "diff_min": diff_if_leave_now,
         }
-
     return {
         "text": f"{abs(diff_if_leave_now)}분 지각 (지금 당장 출발해도 늦음!)",
         "late": True,
@@ -260,7 +286,7 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
 
 
 def current_day_code():
-    wd = now_kst().weekday()  # Mon=0 ... Sun=6
+    wd = now_kst().weekday()
     if wd == 5:
         return 2
     if wd == 6:
@@ -279,11 +305,9 @@ def hhmm_after_offset(offset_min=0):
 @st.cache_data(ttl=300)
 def search_place(query: str):
     keyword_url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-    r = requests.get(
-        keyword_url,
-        headers=kakao_headers(),
-        params={"query": query, "size": 1},
-        timeout=10,
+    r = _session.get(
+        keyword_url, headers=kakao_headers(),
+        params={"query": query, "size": 1}, timeout=10,
     )
     r.raise_for_status()
     data = r.json()
@@ -291,19 +315,18 @@ def search_place(query: str):
 
     if isinstance(docs, list) and docs and isinstance(docs[0], dict):
         d = docs[0]
+        x, y = float(d["x"]), float(d["y"])
+        validate_korea_coords(x, y)
         return {
             "name": d.get("place_name", query),
             "address": d.get("road_address_name") or d.get("address_name") or query,
-            "x": float(d["x"]),
-            "y": float(d["y"]),
+            "x": x, "y": y,
         }
 
     address_url = "https://dapi.kakao.com/v2/local/search/address.json"
-    r = requests.get(
-        address_url,
-        headers=kakao_headers(),
-        params={"query": query, "analyze_type": "similar", "size": 1},
-        timeout=10,
+    r = _session.get(
+        address_url, headers=kakao_headers(),
+        params={"query": query, "analyze_type": "similar", "size": 1}, timeout=10,
     )
     r.raise_for_status()
     data = r.json()
@@ -311,12 +334,9 @@ def search_place(query: str):
 
     if isinstance(docs, list) and docs and isinstance(docs[0], dict):
         d = docs[0]
-        return {
-            "name": query,
-            "address": query,
-            "x": float(d["x"]),
-            "y": float(d["y"]),
-        }
+        x, y = float(d["x"]), float(d["y"])
+        validate_korea_coords(x, y)
+        return {"name": query, "address": query, "x": x, "y": y}
 
     raise ValueError(f"'{query}' 위치를 찾지 못했어. 더 구체적으로 입력해줘.")
 
@@ -326,23 +346,16 @@ def search_place(query: str):
 # =========================================================
 def parse_odsay_error(data):
     err = data.get("error") if isinstance(data, dict) else None
-
     if err is None:
         return None
-
     if isinstance(err, list) and len(err) > 0:
         first = err[0]
         if isinstance(first, dict):
-            code = first.get("code", "")
-            msg = first.get("message", "")
-            return f"ODsay 오류 code={code}, message={msg}"
+            return f"ODsay 오류 code={first.get('code', '')}, message={first.get('message', '')}"
         return f"ODsay 오류: {err}"
-
     if isinstance(err, dict):
-        code = err.get("code", "")
         msg = err.get("message") or err.get("msg") or str(err)
-        return f"ODsay 오류 code={code}, message={msg}"
-
+        return f"ODsay 오류 code={err.get('code', '')}, message={msg}"
     return f"ODsay 오류: {err}"
 
 
@@ -354,16 +367,11 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
     url = "https://api.odsay.com/v1/api/searchPubTransPathR"
     params = {
         "apiKey": ODSAY_API_KEY,
-        "SX": origin_x,
-        "SY": origin_y,
-        "EX": dest_x,
-        "EY": dest_y,
-        "OPT": 0,
-        "lang": 0,
-        "output": "json",
+        "SX": origin_x, "SY": origin_y,
+        "EX": dest_x, "EY": dest_y,
+        "OPT": 0, "lang": 0, "output": "json",
     }
-
-    r = requests.get(url, params=params, headers=odsay_headers(), timeout=20)
+    r = _session.get(url, params=params, headers=odsay_headers(), timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -371,12 +379,9 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
     if err_msg:
         raise ValueError(err_msg)
 
-    result = data.get("result", {})
-    paths = result.get("path", [])
-
+    paths = data.get("result", {}).get("path", [])
     if not isinstance(paths, list) or len(paths) == 0:
         raise ValueError("대중교통 경로를 찾지 못했어.")
-
     return paths
 
 
@@ -389,14 +394,12 @@ def get_best_transit_path(origin_x, origin_y, dest_x, dest_y):
 
     best = None
     best_key = None
-
     for path in paths:
         if not isinstance(path, dict):
             continue
         info = path.get("info", {})
         if not isinstance(info, dict):
             continue
-
         key = (
             safe_int(info.get("totalTime", 999999)),
             safe_int(info.get("payment", 999999)),
@@ -405,7 +408,6 @@ def get_best_transit_path(origin_x, origin_y, dest_x, dest_y):
         if best is None or key < best_key:
             best = path
             best_key = key
-
     return best
 
 
@@ -417,18 +419,14 @@ def get_subway_path_schedule(sid, eid, mode=1, day=1, time_hhmm=None, mid=None):
     url = "https://api.odsay.com/v1/api/subwayPathSchedule"
     params = {
         "apiKey": ODSAY_API_KEY,
-        "SID": sid,
-        "EID": eid,
-        "MODE": mode,
-        "DAY": day,
-        "output": "json",
+        "SID": sid, "EID": eid, "MODE": mode, "DAY": day, "output": "json",
     }
     if time_hhmm:
         params["TIME"] = time_hhmm
     if mid is not None:
         params["MID"] = mid
 
-    r = requests.get(url, params=params, headers=odsay_headers(), timeout=15)
+    r = _session.get(url, params=params, headers=odsay_headers(), timeout=15)
     r.raise_for_status()
     data = r.json()
 
@@ -436,8 +434,7 @@ def get_subway_path_schedule(sid, eid, mode=1, day=1, time_hhmm=None, mid=None):
     if err_msg:
         return None
 
-    result = data.get("result", {})
-    paths = result.get("path", [])
+    paths = data.get("result", {}).get("path", [])
     if not isinstance(paths, list) or not paths:
         return None
 
@@ -449,14 +446,10 @@ def get_subway_path_schedule(sid, eid, mode=1, day=1, time_hhmm=None, mid=None):
         info = p.get("info", {})
         if not isinstance(info, dict):
             continue
-        key = (
-            safe_int(info.get("totalTime", 999999)),
-            safe_int(info.get("transferCount", 999999)),
-        )
+        key = (safe_int(info.get("totalTime", 999999)), safe_int(info.get("transferCount", 999999)))
         if best is None or key < best_key:
             best = p
             best_key = key
-
     return best
 
 
@@ -480,8 +473,7 @@ def get_car_summary(origin_x, origin_y, dest_x, dest_y):
         "Authorization": f"KakaoAK {KAKAO_REST_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r = _session.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -491,7 +483,6 @@ def get_car_summary(origin_x, origin_y, dest_x, dest_y):
 
     summary = routes[0].get("summary", {})
     fare = summary.get("fare", {}) if isinstance(summary, dict) else {}
-
     return {
         "duration_min": math.ceil(safe_int(summary.get("duration", 0)) / 60),
         "distance_km": round(safe_int(summary.get("distance", 0)) / 1000, 1),
@@ -500,21 +491,71 @@ def get_car_summary(origin_x, origin_y, dest_x, dest_y):
     }
 
 
-def valid_taxi_leg(car):
-    # 너무 짧은 택시 구간만 제거
-    return (
+def valid_taxi_leg(car, walk_min_saved=0):
+    """기존 기준 OR 도보 대비 3분 이상 절약 시 유효."""
+    base = (
         safe_int(car.get("duration_min"), 0) >= MIN_TAXI_MIN
         or safe_float(car.get("distance_km"), 0.0) >= MIN_TAXI_KM
         or safe_int(car.get("taxi_fare"), 0) >= MIN_TAXI_FARE
     )
+    if base:
+        return True
+    # 도보 절감 보너스: 도보 5분+ 구간을 택시로 가면 3분 이상 아끼는 경우 유효
+    if walk_min_saved > 0:
+        taxi_min = safe_int(car.get("duration_min"), 0)
+        if (walk_min_saved - taxi_min) >= 3:
+            return True
+    return False
+
+
+# =========================================================
+# Robust 정규화 (IQR 기반)
+# =========================================================
+def robust_normalize(value, values):
+    """IQR 기반 정규화. 아웃라이어에 강건함."""
+    arr = sorted(values)
+    n = len(arr)
+    if n < 2:
+        return 0.0
+
+    q1 = arr[max(0, n // 4)]
+    q3 = arr[min(n - 1, 3 * n // 4)]
+    iqr = q3 - q1
+
+    if iqr == 0:
+        mn, mx = arr[0], arr[-1]
+        if mx == mn:
+            return 0.0
+        return max(0.0, min(1.0, (value - mn) / (mx - mn)))
+
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    clamped = max(lower, min(upper, value))
+    return max(0.0, min(1.0, (clamped - lower) / (upper - lower)))
+
+
+def late_penalty_continuous(c):
+    """지각 분수에 비례하는 연속 페널티. 비지각은 0."""
+    if not c.get("late"):
+        return 0.0
+    diff = abs(c.get("late_diff") or 0)
+    return 0.5 + 0.5 * math.log1p(diff / 5.0)
+
+
+def effective_time(c):
+    """환승 횟수를 시간 페널티로 환산한 실효 시간."""
+    transfers = safe_int(c.get("bus_transit_count", 0)) + safe_int(c.get("subway_transit_count", 0))
+    if c.get("kind") in ("mixed_first", "mixed_last"):
+        transfers += 1
+    return c["time_min"] + transfers * TRANSFER_PENALTY_MIN
 
 
 def is_dominated(a, b):
-    # b가 a보다 시간/비용 둘 다 같거나 더 좋고, 하나 이상 엄격히 좋으면 a는 지배당함
+    """환승 부담까지 반영한 파레토 지배 판정."""
+    ta, tb = effective_time(a), effective_time(b)
     return (
-        b["time_min"] <= a["time_min"]
-        and b["cost"] <= a["cost"]
-        and (b["time_min"] < a["time_min"] or b["cost"] < a["cost"])
+        tb <= ta and b["cost"] <= a["cost"]
+        and (tb < ta or b["cost"] < a["cost"])
     )
 
 
@@ -539,7 +580,6 @@ def mixed_is_reasonable(candidate, taxi_only, best_transit):
 
     total_time = safe_int(candidate.get("time_min"), 0)
     total_cost = safe_int(candidate.get("cost"), 0)
-
     taxi_time = safe_int(candidate.get("taxi_time_min"), 0)
     taxi_km = safe_float(candidate.get("taxi_distance_km"), 0.0)
     taxi_share = taxi_time / max(total_time, 1)
@@ -564,10 +604,15 @@ def mixed_is_reasonable(candidate, taxi_only, best_transit):
     if time_save_vs_taxi is not None and time_save_vs_taxi >= MIXED_NEAR_TAXI_MIN_TIME_SAVE:
         return True
 
-    # 3) 대중교통보다 충분히 빠르고 추가비용이 과하지 않으면 유지
-    if time_save_vs_transit is not None and time_save_vs_transit >= MIXED_KEEP_TIME_SAVE_VS_TRANSIT:
-        if extra_cost_vs_transit is None or extra_cost_vs_transit <= MIXED_MAX_EXTRA_COST_VS_TRANSIT:
-            return True
+    # 3) 대중교통보다 충분히 빠르고 추가비용이 과하지 않으면 유지 (절대값 + 비율)
+    if time_save_vs_transit is not None and best_transit is not None:
+        ratio = time_save_vs_transit / max(best_transit["time_min"], 1)
+        if (
+            time_save_vs_transit >= MIXED_KEEP_TIME_SAVE_VS_TRANSIT_ABS
+            or ratio >= MIXED_KEEP_TIME_SAVE_VS_TRANSIT_RATIO
+        ):
+            if extra_cost_vs_transit is None or extra_cost_vs_transit <= MIXED_MAX_EXTRA_COST_VS_TRANSIT:
+                return True
 
     # 4) 대중교통은 지각인데 혼합은 제시간이면 유지
     if best_transit is not None and best_transit.get("late") and not candidate.get("late"):
@@ -576,7 +621,6 @@ def mixed_is_reasonable(candidate, taxi_only, best_transit):
     # 5) 거의 택시만 수준인데 이점이 없으면 제거
     if taxi_share >= MIXED_HIGH_TAXI_SHARE or taxi_km >= MIXED_HIGH_TAXI_KM:
         if cost_save_vs_taxi is not None and time_save_vs_taxi is not None:
-            # 택시만보다 충분히 안 싸고, 충분히 안 빠르면 제거
             if (
                 cost_save_vs_taxi < MIXED_NEAR_TAXI_MIN_COST_SAVE
                 and time_save_vs_taxi < MIXED_NEAR_TAXI_MIN_TIME_SAVE
@@ -594,7 +638,6 @@ def normalize_result_list(data):
         return data
     if not isinstance(data, dict):
         return []
-
     result = data.get("result")
     if isinstance(result, list):
         return result
@@ -612,16 +655,12 @@ def normalize_result_list(data):
 @st.cache_data(ttl=REALTIME_BUS_CACHE_TTL)
 def get_realtime_station(station_id):
     url = "https://api.odsay.com/v1/api/realtimeStation"
-    params = {
-        "apiKey": ODSAY_API_KEY,
-        "stationID": station_id,
-    }
+    params = {"apiKey": ODSAY_API_KEY, "stationID": station_id}
     try:
-        r = requests.get(url, params=params, headers=odsay_headers(), timeout=10)
+        r = _session.get(url, params=params, headers=odsay_headers(), timeout=10)
         r.raise_for_status()
         data = r.json()
-        err_msg = parse_odsay_error(data) if isinstance(data, dict) else None
-        if err_msg:
+        if isinstance(data, dict) and parse_odsay_error(data):
             return []
         return normalize_result_list(data)
     except Exception:
@@ -631,16 +670,12 @@ def get_realtime_station(station_id):
 @st.cache_data(ttl=REALTIME_BUS_CACHE_TTL)
 def get_realtime_route(bus_id):
     url = "https://api.odsay.com/v1/api/realtimeRoute"
-    params = {
-        "apiKey": ODSAY_API_KEY,
-        "busID": bus_id,
-    }
+    params = {"apiKey": ODSAY_API_KEY, "busID": bus_id}
     try:
-        r = requests.get(url, params=params, headers=odsay_headers(), timeout=10)
+        r = _session.get(url, params=params, headers=odsay_headers(), timeout=10)
         r.raise_for_status()
         data = r.json()
-        err_msg = parse_odsay_error(data) if isinstance(data, dict) else None
-        if err_msg:
+        if isinstance(data, dict) and parse_odsay_error(data):
             return []
         return normalize_result_list(data)
     except Exception:
@@ -650,13 +685,7 @@ def get_realtime_route(bus_id):
 def extract_station_id_from_subpath(sp):
     return first_non_none(
         sp,
-        [
-            "startID",
-            "startStationID",
-            "stationID",
-            "localStationID",
-            "startLocalStationID",
-        ],
+        ["startID", "startStationID", "stationID", "localStationID", "startLocalStationID"],
         None,
     )
 
@@ -664,18 +693,14 @@ def extract_station_id_from_subpath(sp):
 def extract_bus_lane_meta(sp):
     if not isinstance(sp, dict) or sp.get("trafficType") != 2:
         return None
-
     lane = sp.get("lane", [])
     if not isinstance(lane, list) or not lane:
         return None
-
     l0 = lane[0]
     if not isinstance(l0, dict):
         return None
-
     bus_no = first_non_none(l0, ["busNo", "name", "busNum"], None)
     bus_id = first_non_none(l0, ["busID", "busLocalBlID", "localBusID", "busLocalBlId"], None)
-
     return {
         "bus_no": str(bus_no) if bus_no is not None else None,
         "bus_id": str(bus_id) if bus_id is not None else None,
@@ -685,55 +710,38 @@ def extract_bus_lane_meta(sp):
 def parse_arrival_minutes(item):
     if not isinstance(item, dict):
         return None
-
-    keys = [
-        "arrivalSec",
-        "arrivalSec1",
-        "leftTime",
-        "arrivalTime",
-        "arriveTime",
-        "predictTime1",
-    ]
-
+    keys = ["arrivalSec", "arrivalSec1", "leftTime", "arrivalTime", "arriveTime", "predictTime1"]
     for key in keys:
         if key not in item:
             continue
-        raw = item.get(key)
-        val = safe_int(raw, None)
+        val = safe_int(item.get(key), None)
         if val is None:
             continue
-
         if "Sec" in key or val > 60:
             return max(1, math.ceil(val / 60))
         return max(1, val)
-
     return None
 
 
 def matches_bus(item, bus_no=None, bus_id=None):
     if not isinstance(item, dict):
         return False
-
     if bus_id is not None:
         for key in ["busID", "localBusID", "busLocalBlID", "busLocalBlId"]:
             if str(item.get(key, "")).strip() == str(bus_id).strip():
                 return True
-
     if bus_no is not None:
         for key in ["busNo", "routeNo", "routeNm", "name"]:
             if str(item.get(key, "")).strip() == str(bus_no).strip():
                 return True
-
     return False
 
 
 def pick_best_realtime_arrival(arrivals, bus_no=None, bus_id=None):
     if not isinstance(arrivals, list) or not arrivals:
         return None
-
     matched = [a for a in arrivals if matches_bus(a, bus_no=bus_no, bus_id=bus_id)]
     pool = matched if matched else arrivals
-
     best = None
     best_min = None
     for item in pool:
@@ -743,20 +751,16 @@ def pick_best_realtime_arrival(arrivals, bus_no=None, bus_id=None):
         if best is None or arr_min < best_min:
             best = item
             best_min = arr_min
-
     return best
 
 
 def get_bus_live_info_for_subpath(sp):
     if not REALTIME_BUS_ENABLED:
         return None
-
     if not isinstance(sp, dict) or sp.get("trafficType") != 2:
         return None
-
     lane_meta = extract_bus_lane_meta(sp)
     station_id = extract_station_id_from_subpath(sp)
-
     if lane_meta is None or station_id is None:
         return None
 
@@ -772,11 +776,8 @@ def get_bus_live_info_for_subpath(sp):
 
     if wait_min is None and bus_count is None:
         return None
-
     return {
-        "bus_no": bus_no,
-        "bus_id": bus_id,
-        "station_id": station_id,
+        "bus_no": bus_no, "bus_id": bus_id, "station_id": station_id,
         "wait_min": min(wait_min, REALTIME_BUS_WAIT_CAP_MIN) if wait_min is not None else None,
         "bus_count": bus_count,
     }
@@ -785,42 +786,32 @@ def get_bus_live_info_for_subpath(sp):
 def compute_transit_live_adjustment(path, start_offset_min=0):
     if not REALTIME_BUS_ENABLED or not isinstance(path, dict):
         return {"extra_wait_min": 0, "notes": []}
-
     if start_offset_min > 0:
         return {"extra_wait_min": 0, "notes": []}
-
     subpaths = path.get("subPath", [])
     if not isinstance(subpaths, list):
         return {"extra_wait_min": 0, "notes": []}
 
     extra_wait = 0
     notes = []
-
     for sp in subpaths:
         if not isinstance(sp, dict) or sp.get("trafficType") != 2:
             continue
-
         live = get_bus_live_info_for_subpath(sp)
         if not live:
             continue
-
         start_name = sp.get("startName", "")
         bus_label = live.get("bus_no") or "버스"
-
         pieces = []
         if live.get("wait_min") is not None:
             extra_wait += live["wait_min"]
             pieces.append(f"도착 {live['wait_min']}분")
         if live.get("bus_count") is not None:
             pieces.append(f"운행 {live['bus_count']}대")
-
         if pieces:
             notes.append(f"{bus_label}번 ({start_name}) 실시간: " + ", ".join(pieces))
 
-    return {
-        "extra_wait_min": extra_wait,
-        "notes": notes,
-    }
+    return {"extra_wait_min": extra_wait, "notes": notes}
 
 
 # =========================================================
@@ -842,7 +833,6 @@ def extract_subway_line_name(sp):
 def compute_subway_schedule_adjustment(path, start_offset_min=0):
     if not REALTIME_SUBWAY_SCHEDULE_ENABLED or not isinstance(path, dict):
         return {"delta_min": 0, "notes": []}
-
     subpaths = path.get("subPath", [])
     if not isinstance(subpaths, list):
         return {"delta_min": 0, "notes": []}
@@ -855,10 +845,8 @@ def compute_subway_schedule_adjustment(path, start_offset_min=0):
     for sp in subpaths:
         if not isinstance(sp, dict):
             continue
-
         base_section = safe_int(sp.get("sectionTime", 0))
         traffic_type = sp.get("trafficType")
-
         if traffic_type != 1:
             cumulative_min += base_section
             continue
@@ -870,13 +858,8 @@ def compute_subway_schedule_adjustment(path, start_offset_min=0):
 
         time_hhmm = hhmm_after_offset(cumulative_min)
         sched_path = get_subway_path_schedule(
-            sid=sid,
-            eid=eid,
-            mode=1,
-            day=day_code,
-            time_hhmm=time_hhmm,
+            sid=sid, eid=eid, mode=1, day=day_code, time_hhmm=time_hhmm,
         )
-
         if not isinstance(sched_path, dict):
             cumulative_min += base_section
             continue
@@ -889,14 +872,12 @@ def compute_subway_schedule_adjustment(path, start_offset_min=0):
         sched_total = safe_int(info.get("totalTime", base_section))
         dep = info.get("departureTime")
         arr = info.get("arrivalTime")
-
         delta = sched_total - base_section
         delta_total += delta
 
         start_name = sp.get("startName", "")
         end_name = sp.get("endName", "")
         line_name = extract_subway_line_name(sp)
-
         pieces = [f"{line_name} {start_name}→{end_name}"]
         if dep:
             pieces.append(f"{dep} 출발")
@@ -905,32 +886,22 @@ def compute_subway_schedule_adjustment(path, start_offset_min=0):
         if delta != 0:
             sign = "+" if delta > 0 else ""
             pieces.append(f"{sign}{delta}분 보정")
-
         notes.append(" / ".join(pieces))
         cumulative_min += sched_total
 
-    return {
-        "delta_min": delta_total,
-        "notes": notes,
-    }
+    return {"delta_min": delta_total, "notes": notes}
 
 
 # =========================================================
 # 포맷팅
 # =========================================================
 def path_type_to_text(path_type):
-    mapping = {
-        1: "지하철",
-        2: "버스",
-        3: "버스+지하철",
-    }
-    return mapping.get(path_type, f"기타({path_type})")
+    return {1: "지하철", 2: "버스", 3: "버스+지하철"}.get(path_type, f"기타({path_type})")
 
 
 def format_subpath(sp):
     if not isinstance(sp, dict):
         return str(sp)
-
     traffic_type = sp.get("trafficType")
     section_time = safe_int(sp.get("sectionTime", 0))
     start_name = sp.get("startName", "")
@@ -941,7 +912,6 @@ def format_subpath(sp):
 
     lane = sp.get("lane", [])
     lane_label = "이동"
-
     if isinstance(lane, list) and len(lane) > 0:
         first_lane = lane[0]
         if isinstance(first_lane, dict):
@@ -960,12 +930,9 @@ def format_subpath(sp):
 
 
 def summarize_subpaths(subpaths):
-    lines = []
     if not isinstance(subpaths, list):
-        return lines
-    for sp in subpaths:
-        lines.append(format_subpath(sp))
-    return lines
+        return []
+    return [format_subpath(sp) for sp in subpaths]
 
 
 def path_to_summary(path, start_offset_min=0):
@@ -995,31 +962,21 @@ def path_to_summary(path, start_offset_min=0):
         "steps": summarize_subpaths(subpaths),
         "live_notes": bus_live.get("notes", []) + subway_sched.get("notes", []),
     }
+
+
 def normalize_candidate_point(name, x, y):
     if not name:
         return None
-
     x = safe_float(x, None)
     y = safe_float(y, None)
-
     if x is None or y is None:
         return None
-
-    return {
-        "name": str(name),
-        "x": x,
-        "y": y,
-    }
+    return {"name": str(name), "x": x, "y": y}
 
 
 def get_pass_stop_points(sp):
-    """
-    ODsay subPath 안의 passStopList에서 중간 정류장/역 후보를 뽑는다.
-    버스/지하철 응답 구조가 조금 달라도 최대한 유연하게 처리.
-    """
     if not isinstance(sp, dict):
         return []
-
     pass_stop_list = sp.get("passStopList")
     if not isinstance(pass_stop_list, dict):
         return []
@@ -1030,7 +987,6 @@ def get_pass_stop_points(sp):
         if isinstance(val, list):
             raw_items = val
             break
-
     if not isinstance(raw_items, list):
         return []
 
@@ -1038,58 +994,27 @@ def get_pass_stop_points(sp):
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-
-        name = first_non_none(
-            item,
-            ["stationName", "name", "stopName", "startName", "endName"],
-            None,
-        )
-        x = first_non_none(
-            item,
-            ["x", "X", "gpsX", "lon", "lng", "longitude"],
-            None,
-        )
-        y = first_non_none(
-            item,
-            ["y", "Y", "gpsY", "lat", "latitude"],
-            None,
-        )
-
+        name = first_non_none(item, ["stationName", "name", "stopName", "startName", "endName"], None)
+        x = first_non_none(item, ["x", "X", "gpsX", "lon", "lng", "longitude"], None)
+        y = first_non_none(item, ["y", "Y", "gpsY", "lat", "latitude"], None)
         p = normalize_candidate_point(name, x, y)
         if p is not None:
             points.append(p)
-
     return points
 
 
 def collect_subpath_points(sp):
-    """
-    한 subPath에서 start / passStopList / end 를 모두 모은다.
-    """
     if not isinstance(sp, dict):
         return []
-
     points = []
-
-    start_p = normalize_candidate_point(
-        sp.get("startName"),
-        sp.get("startX"),
-        sp.get("startY"),
-    )
+    start_p = normalize_candidate_point(sp.get("startName"), sp.get("startX"), sp.get("startY"))
     if start_p is not None:
         points.append(start_p)
-
     points.extend(get_pass_stop_points(sp))
-
-    end_p = normalize_candidate_point(
-        sp.get("endName"),
-        sp.get("endX"),
-        sp.get("endY"),
-    )
+    end_p = normalize_candidate_point(sp.get("endName"), sp.get("endX"), sp.get("endY"))
     if end_p is not None:
         points.append(end_p)
 
-    # 중복 제거
     dedup = []
     seen = set()
     for p in points:
@@ -1098,104 +1023,216 @@ def collect_subpath_points(sp):
             continue
         seen.add(key)
         dedup.append(p)
-
     return dedup
 
+
 # =========================================================
-# 후보 지점 추출
+# 후보 지점 추출 (균등 할당 + Haversine 사전 필터)
 # =========================================================
-def extract_board_candidates(paths, origin):
-    """
-    출발지에서 택시를 타고 갈 '탑승 후보'를 추출.
-    기존: 각 subPath의 start만
-    변경: start + 중간 정류장/역 + end 전부 후보화
-    """
+def _collect_raw_points(paths, reference, exclude_point):
+    """경로들에서 대중교통 정류장/역 좌표를 모두 수집 (경로별 균등)."""
+    per_path_limit = max(3, MAX_INTERMEDIATE_CANDIDATES // min(len(paths), MAX_TRANSIT_PATHS))
     candidates = []
     seen = set()
 
     for path in paths[:MAX_TRANSIT_PATHS]:
         if not isinstance(path, dict):
             continue
-
-        subpaths = path.get("subPath", [])
-        if not isinstance(subpaths, list):
-            continue
-
-        for sp in subpaths:
-            if not isinstance(sp, dict):
+        path_points = []
+        for sp in path.get("subPath", []):
+            if not isinstance(sp, dict) or sp.get("trafficType") not in (1, 2):
                 continue
-
-            traffic_type = sp.get("trafficType")
-            if traffic_type not in (1, 2):  # 지하철/버스만
-                continue
-
-            points = collect_subpath_points(sp)
-
-            for p in points:
-                if is_same_point(p["x"], p["y"], origin["x"], origin["y"]):
+            for p in collect_subpath_points(sp):
+                if is_same_point(p["x"], p["y"], exclude_point["x"], exclude_point["y"]):
                     continue
-
-                key = (round(p["x"], 6), round(p["y"], 6), p["name"])
+                key = (round(p["x"], 6), round(p["y"], 6))
                 if key in seen:
                     continue
                 seen.add(key)
+                d = haversine_km(reference["x"], reference["y"], p["x"], p["y"])
+                path_points.append((d, p))
 
-                candidates.append(p)
+        path_points.sort(key=lambda x: x[0])
+        for _, p in path_points[:per_path_limit]:
+            candidates.append(p)
 
     return candidates[:MAX_INTERMEDIATE_CANDIDATES]
 
 
-def extract_split_candidates(paths, destination):
-    """
-    목적지 직전에 택시로 전환할 '하차 후보'를 추출.
-    기존: 각 subPath의 end만
-    변경: start + 중간 정류장/역 + end 전부 후보화
-    """
-    candidates = []
-    seen = set()
-
-    for path in paths[:MAX_TRANSIT_PATHS]:
-        if not isinstance(path, dict):
+def prefilter_candidates(candidates, reference, total_dist_km, is_board=True):
+    """Haversine 사전 필터: 너무 가깝거나 너무 먼 후보 제거."""
+    filtered = []
+    for c in candidates:
+        d = haversine_km(reference["x"], reference["y"], c["x"], c["y"])
+        if d < PREFILTER_MIN_KM:
             continue
-
-        subpaths = path.get("subPath", [])
-        if not isinstance(subpaths, list):
+        if d > total_dist_km * PREFILTER_MAX_RATIO:
             continue
+        filtered.append((d, c))
 
-        for sp in subpaths:
-            if not isinstance(sp, dict):
-                continue
+    filtered.sort(key=lambda x: x[0])
+    return [c for _, c in filtered[:PREFILTER_TOP_N]]
 
-            traffic_type = sp.get("trafficType")
-            if traffic_type not in (1, 2):
-                continue
 
-            points = collect_subpath_points(sp)
+def extract_board_candidates(paths, origin, destination):
+    raw = _collect_raw_points(paths, origin, origin)
+    total_dist = haversine_km(origin["x"], origin["y"], destination["x"], destination["y"])
+    return prefilter_candidates(raw, origin, total_dist, is_board=True)
 
-            for p in points:
-                if is_same_point(p["x"], p["y"], destination["x"], destination["y"]):
-                    continue
 
-                key = (round(p["x"], 6), round(p["y"], 6), p["name"])
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                candidates.append(p)
-
-    return candidates[:MAX_INTERMEDIATE_CANDIDATES]
+def extract_split_candidates(paths, origin, destination):
+    raw = _collect_raw_points(paths, destination, destination)
+    total_dist = haversine_km(origin["x"], origin["y"], destination["x"], destination["y"])
+    return prefilter_candidates(raw, destination, total_dist, is_board=False)
 
 
 # =========================================================
-# 후보 생성
+# 후보 생성 (병렬화)
 # =========================================================
+def _process_board_candidate(board, origin, destination):
+    """단일 board 후보에 대한 (택시→대중교통) 경로 계산. ThreadPool에서 호출."""
+    try:
+        car_head = get_car_summary(
+            round_coord(origin["x"]), round_coord(origin["y"]),
+            round_coord(board["x"]), round_coord(board["y"]),
+        )
+        if not valid_taxi_leg(car_head):
+            return None
+
+        transit_from_board = get_best_transit_path(
+            round_coord(board["x"]), round_coord(board["y"]),
+            round_coord(destination["x"]), round_coord(destination["y"]),
+        )
+        if transit_from_board is None:
+            return None
+
+        return {"board": board, "car_head": car_head, "transit": transit_from_board}
+    except Exception:
+        return None
+
+
+def _process_split_candidate(split, origin, destination):
+    """단일 split 후보에 대한 (대중교통→택시) 경로 계산. ThreadPool에서 호출."""
+    try:
+        transit_to_split = get_best_transit_path(
+            round_coord(origin["x"]), round_coord(origin["y"]),
+            round_coord(split["x"]), round_coord(split["y"]),
+        )
+        if transit_to_split is None:
+            return None
+
+        car_tail = get_car_summary(
+            round_coord(split["x"]), round_coord(split["y"]),
+            round_coord(destination["x"]), round_coord(destination["y"]),
+        )
+        if not valid_taxi_leg(car_tail):
+            return None
+
+        return {"split": split, "car_tail": car_tail, "transit": transit_to_split}
+    except Exception:
+        return None
+
+
+def _apply_direct_stop_board(result, origin, destination):
+    """board 후보에 대해 직접 정류장 보정을 적용."""
+    board = result["board"]
+    car_head = result["car_head"]
+    transit_from_board = result["transit"]
+
+    first_stop = get_first_boarding_stop(transit_from_board)
+    if (
+        first_stop is not None
+        and first_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
+        and not is_same_point(board["x"], board["y"], first_stop["x"], first_stop["y"])
+    ):
+        try:
+            car_head_direct = get_car_summary(
+                round_coord(origin["x"]), round_coord(origin["y"]),
+                round_coord(first_stop["x"]), round_coord(first_stop["y"]),
+            )
+            if valid_taxi_leg(car_head_direct, walk_min_saved=first_stop["walk_min"]):
+                transit_from_direct = get_best_transit_path(
+                    round_coord(first_stop["x"]), round_coord(first_stop["y"]),
+                    round_coord(destination["x"]), round_coord(destination["y"]),
+                )
+                if transit_from_direct is not None:
+                    old_summary = path_to_summary(transit_from_board, start_offset_min=car_head["duration_min"])
+                    new_summary = path_to_summary(transit_from_direct, start_offset_min=car_head_direct["duration_min"])
+                    if old_summary and new_summary:
+                        old_t = car_head["duration_min"] + old_summary["time_min"]
+                        old_c = car_head["taxi_fare"] + old_summary["cost"]
+                        new_t = car_head_direct["duration_min"] + new_summary["time_min"]
+                        new_c = car_head_direct["taxi_fare"] + new_summary["cost"]
+                        if should_replace_with_direct_stop(old_t, old_c, new_t, new_c):
+                            return {
+                                "board": {"name": first_stop["name"], "x": first_stop["x"], "y": first_stop["y"]},
+                                "car_head": car_head_direct,
+                                "transit": transit_from_direct,
+                            }
+        except Exception:
+            pass
+
+    return result
+
+
+def _apply_direct_stop_split(result, origin, destination):
+    """split 후보에 대해 직접 정류장 보정을 적용."""
+    split = result["split"]
+    car_tail = result["car_tail"]
+    transit_to_split = result["transit"]
+
+    last_stop = get_last_alighting_stop(transit_to_split)
+    if (
+        last_stop is not None
+        and last_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
+        and not is_same_point(split["x"], split["y"], last_stop["x"], last_stop["y"])
+    ):
+        try:
+            transit_to_direct = get_best_transit_path(
+                round_coord(origin["x"]), round_coord(origin["y"]),
+                round_coord(last_stop["x"]), round_coord(last_stop["y"]),
+            )
+            car_tail_direct = get_car_summary(
+                round_coord(last_stop["x"]), round_coord(last_stop["y"]),
+                round_coord(destination["x"]), round_coord(destination["y"]),
+            )
+            if transit_to_direct is not None and valid_taxi_leg(car_tail_direct, walk_min_saved=last_stop["walk_min"]):
+                old_summary = path_to_summary(transit_to_split, start_offset_min=0)
+                new_summary = path_to_summary(transit_to_direct, start_offset_min=0)
+                if old_summary and new_summary:
+                    old_t = old_summary["time_min"] + car_tail["duration_min"]
+                    old_c = old_summary["cost"] + car_tail["taxi_fare"]
+                    new_t = new_summary["time_min"] + car_tail_direct["duration_min"]
+                    new_c = new_summary["cost"] + car_tail_direct["taxi_fare"]
+                    if should_replace_with_direct_stop(old_t, old_c, new_t, new_c):
+                        return {
+                            "split": {"name": last_stop["name"], "x": last_stop["x"], "y": last_stop["y"]},
+                            "car_tail": car_tail_direct,
+                            "transit": transit_to_direct,
+                        }
+        except Exception:
+            pass
+
+    return result
+
+
 def build_route_candidates(origin, destination, arrive_by):
-    base_transit_paths = get_transit_paths(
-        origin["x"], origin["y"], destination["x"], destination["y"]
-    )
-    car_full = get_car_summary(
-        origin["x"], origin["y"], destination["x"], destination["y"]
-    )
+    # Phase 0: 대중교통 — 실패해도 택시만은 살림
+    try:
+        base_transit_paths = get_transit_paths(
+            round_coord(origin["x"]), round_coord(origin["y"]),
+            round_coord(destination["x"]), round_coord(destination["y"]),
+        )
+    except Exception:
+        base_transit_paths = []
+
+    try:
+        car_full = get_car_summary(
+            round_coord(origin["x"]), round_coord(origin["y"]),
+            round_coord(destination["x"]), round_coord(destination["y"]),
+        )
+    except Exception as e:
+        raise ValueError(f"택시 경로조차 조회 실패: {e}")
 
     candidates = []
 
@@ -1212,22 +1249,23 @@ def build_route_candidates(origin, destination, arrive_by):
         "status": taxi_status["text"],
         "late": taxi_status["late"],
         "late_diff": taxi_status["diff_min"],
-        "reason": "가장 빠르지만 비용이 큼",
+        "reason": "현재 시간대 대중교통 미운행. 택시만 이용 가능." if not base_transit_paths else "가장 빠르지만 비용이 큼",
         "steps": ["출발지에서 바로 택시 이용"],
         "live_notes": [],
     })
+
+    if not base_transit_paths:
+        return candidates
 
     # 2) 대중교통만
     for idx, path in enumerate(base_transit_paths[:MAX_TRANSIT_PATHS], start=1):
         if not isinstance(path, dict):
             continue
-
         summary = path_to_summary(path, start_offset_min=0)
         if summary is None:
             continue
 
         transit_status = calc_arrival_status(summary["time_min"], arrive_by)
-
         reason = "가장 저렴한 선택지에 가까움"
         if summary["bus_live_extra_min"] > 0:
             reason += f" / 버스 실시간 대기 {summary['bus_live_extra_min']}분 반영"
@@ -1253,224 +1291,117 @@ def build_route_candidates(origin, destination, arrive_by):
             "live_notes": summary["live_notes"],
         })
 
-    # 3) 택시 -> 대중교통
-    board_candidates = extract_board_candidates(base_transit_paths, origin)
-    for board in board_candidates:
-        try:
-            car_head = get_car_summary(
-                origin["x"], origin["y"], board["x"], board["y"]
-            )
-            if not valid_taxi_leg(car_head):
-                continue
+    # Phase 1 (병렬): board/split 후보에 대한 기본 API 호출
+    board_candidates = extract_board_candidates(base_transit_paths, origin, destination)
+    split_candidates_list = extract_split_candidates(base_transit_paths, origin, destination)
 
-            transit_from_board = get_best_transit_path(
-                board["x"], board["y"], destination["x"], destination["y"]
-            )
-            if transit_from_board is None:
-                continue
+    board_results = []
+    split_results = []
 
-            # 첫 승차 정류장까지 도보가 길면 직접 그 정류장까지 택시
-            first_stop = get_first_boarding_stop(transit_from_board)
-            if (
-                first_stop is not None
-                and first_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
-                and not is_same_point(
-                    board["x"], board["y"], first_stop["x"], first_stop["y"]
-                )
-            ):
-                try:
-                    car_head_direct = get_car_summary(
-                        origin["x"], origin["y"], first_stop["x"], first_stop["y"]
-                    )
-                    if valid_taxi_leg(car_head_direct):
-                        transit_from_direct = get_best_transit_path(
-                            first_stop["x"], first_stop["y"],
-                            destination["x"], destination["y"]
-                        )
-                        if transit_from_direct is not None:
-                            old_summary = path_to_summary(
-                                transit_from_board,
-                                start_offset_min=car_head["duration_min"]
-                            )
-                            new_summary = path_to_summary(
-                                transit_from_direct,
-                                start_offset_min=car_head_direct["duration_min"]
-                            )
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        board_futures = {
+            pool.submit(_process_board_candidate, b, origin, destination): b
+            for b in board_candidates
+        }
+        split_futures = {
+            pool.submit(_process_split_candidate, s, origin, destination): s
+            for s in split_candidates_list
+        }
 
-                            if old_summary is not None and new_summary is not None:
-                                old_total_time = (
-                                    car_head["duration_min"] + old_summary["time_min"]
-                                )
-                                old_total_cost = (
-                                    car_head["taxi_fare"] + old_summary["cost"]
-                                )
+        for future in as_completed(board_futures):
+            result = future.result()
+            if result is not None:
+                board_results.append(result)
 
-                                new_total_time = (
-                                    car_head_direct["duration_min"] + new_summary["time_min"]
-                                )
-                                new_total_cost = (
-                                    car_head_direct["taxi_fare"] + new_summary["cost"]
-                                )
+        for future in as_completed(split_futures):
+            result = future.result()
+            if result is not None:
+                split_results.append(result)
 
-                                if should_replace_with_direct_stop(
-                                    old_total_time, old_total_cost,
-                                    new_total_time, new_total_cost
-                                ):
-                                    board = {
-                                        "name": first_stop["name"],
-                                        "x": first_stop["x"],
-                                        "y": first_stop["y"],
-                                    }
-                                    car_head = car_head_direct
-                                    transit_from_board = transit_from_direct
-                except Exception:
-                    pass
+    # Phase 2 (순차): direct stop 보정 (해당되는 것만)
+    for result in board_results:
+        result = _apply_direct_stop_board(result, origin, destination)
+        board = result["board"]
+        car_head = result["car_head"]
+        transit_from_board = result["transit"]
 
-            transit_summary = path_to_summary(
-                transit_from_board, start_offset_min=car_head["duration_min"]
-            )
-            if transit_summary is None:
-                continue
-
-            total_mix_time = car_head["duration_min"] + transit_summary["time_min"]
-            total_mix_cost = car_head["taxi_fare"] + transit_summary["cost"]
-            mix_status = calc_arrival_status(total_mix_time, arrive_by)
-
-            reason = f"초반만 택시로 이동하고 {board['name']}부터 대중교통 최적 경로 이용"
-            if transit_summary["subway_sched_delta_min"] != 0:
-                sign = "+" if transit_summary["subway_sched_delta_min"] > 0 else ""
-                reason += f" / 지하철 시간표 {sign}{transit_summary['subway_sched_delta_min']}분 보정"
-
-            candidates.append({
-                "kind": "mixed_first",
-                "title": "택시 → 대중교통",
-                "subtitle": f"{board['name']}에서 대중교통 탑승",
-                "time_min": total_mix_time,
-                "cost": total_mix_cost,
-                "distance_km": car_head["distance_km"],
-                "walk_m": transit_summary["walk_m"],
-                "status": mix_status["text"],
-                "late": mix_status["late"],
-                "late_diff": mix_status["diff_min"],
-                "reason": reason,
-                "steps": [f"출발지 → {board['name']} 택시 {car_head['duration_min']}분"] + transit_summary["steps"],
-                "board_name": board["name"],
-                "live_notes": transit_summary["live_notes"],
-                "taxi_time_min": car_head["duration_min"],
-                "taxi_distance_km": car_head["distance_km"],
-                "taxi_cost": car_head["taxi_fare"],
-                "transit_time_min": transit_summary["time_min"],
-                "transit_cost": transit_summary["cost"],
-            })
-        except Exception:
+        transit_summary = path_to_summary(transit_from_board, start_offset_min=car_head["duration_min"])
+        if transit_summary is None:
             continue
 
-    # 4) 대중교통 -> 택시
-    split_candidates = extract_split_candidates(base_transit_paths, destination)
-    for split in split_candidates:
-        try:
-            transit_to_split = get_best_transit_path(
-                origin["x"], origin["y"], split["x"], split["y"]
-            )
-            if transit_to_split is None:
-                continue
+        total_mix_time = car_head["duration_min"] + transit_summary["time_min"]
+        total_mix_cost = car_head["taxi_fare"] + transit_summary["cost"]
+        mix_status = calc_arrival_status(total_mix_time, arrive_by)
 
-            transit_summary = path_to_summary(transit_to_split, start_offset_min=0)
-            if transit_summary is None:
-                continue
+        reason = f"초반만 택시로 이동하고 {board['name']}부터 대중교통 최적 경로 이용"
+        if transit_summary["subway_sched_delta_min"] != 0:
+            sign = "+" if transit_summary["subway_sched_delta_min"] > 0 else ""
+            reason += f" / 지하철 시간표 {sign}{transit_summary['subway_sched_delta_min']}분 보정"
 
-            car_tail = get_car_summary(
-                split["x"], split["y"], destination["x"], destination["y"]
-            )
-            if not valid_taxi_leg(car_tail):
-                continue
+        candidates.append({
+            "kind": "mixed_first",
+            "title": "택시 → 대중교통",
+            "subtitle": f"{board['name']}에서 대중교통 탑승",
+            "time_min": total_mix_time,
+            "cost": total_mix_cost,
+            "distance_km": car_head["distance_km"],
+            "walk_m": transit_summary["walk_m"],
+            "status": mix_status["text"],
+            "late": mix_status["late"],
+            "late_diff": mix_status["diff_min"],
+            "reason": reason,
+            "steps": [f"출발지 → {board['name']} 택시 {car_head['duration_min']}분"] + transit_summary["steps"],
+            "board_name": board["name"],
+            "live_notes": transit_summary["live_notes"],
+            "taxi_time_min": car_head["duration_min"],
+            "taxi_distance_km": car_head["distance_km"],
+            "taxi_cost": car_head["taxi_fare"],
+            "transit_time_min": transit_summary["time_min"],
+            "transit_cost": transit_summary["cost"],
+        })
 
-            # 마지막 하차 후 도보가 길면 실제 마지막 하차 정류장에서 바로 택시
-            last_stop = get_last_alighting_stop(transit_to_split)
-            if (
-                last_stop is not None
-                and last_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
-                and not is_same_point(
-                    split["x"], split["y"], last_stop["x"], last_stop["y"]
-                )
-            ):
-                try:
-                    transit_to_direct = get_best_transit_path(
-                        origin["x"], origin["y"], last_stop["x"], last_stop["y"]
-                    )
-                    car_tail_direct = get_car_summary(
-                        last_stop["x"], last_stop["y"],
-                        destination["x"], destination["y"]
-                    )
+    for result in split_results:
+        result = _apply_direct_stop_split(result, origin, destination)
+        split = result["split"]
+        car_tail = result["car_tail"]
+        transit_to_split = result["transit"]
 
-                    if transit_to_direct is not None and valid_taxi_leg(car_tail_direct):
-                        new_transit_summary = path_to_summary(
-                            transit_to_direct, start_offset_min=0
-                        )
-                        if new_transit_summary is not None:
-                            old_total_time = (
-                                transit_summary["time_min"] + car_tail["duration_min"]
-                            )
-                            old_total_cost = (
-                                transit_summary["cost"] + car_tail["taxi_fare"]
-                            )
-
-                            new_total_time = (
-                                new_transit_summary["time_min"] + car_tail_direct["duration_min"]
-                            )
-                            new_total_cost = (
-                                new_transit_summary["cost"] + car_tail_direct["taxi_fare"]
-                            )
-
-                            if should_replace_with_direct_stop(
-                                old_total_time, old_total_cost,
-                                new_total_time, new_total_cost
-                            ):
-                                split = {
-                                    "name": last_stop["name"],
-                                    "x": last_stop["x"],
-                                    "y": last_stop["y"],
-                                }
-                                transit_to_split = transit_to_direct
-                                transit_summary = new_transit_summary
-                                car_tail = car_tail_direct
-                except Exception:
-                    pass
-
-            total_mix_time = transit_summary["time_min"] + car_tail["duration_min"]
-            total_mix_cost = transit_summary["cost"] + car_tail["taxi_fare"]
-            mix_status = calc_arrival_status(total_mix_time, arrive_by)
-
-            reason = f"{split['name']}까지 대중교통 후 마지막 구간만 택시"
-            if transit_summary["bus_live_extra_min"] > 0:
-                reason += f" / 버스 실시간 대기 {transit_summary['bus_live_extra_min']}분 반영"
-            if transit_summary["subway_sched_delta_min"] != 0:
-                sign = "+" if transit_summary["subway_sched_delta_min"] > 0 else ""
-                reason += f" / 지하철 시간표 {sign}{transit_summary['subway_sched_delta_min']}분 보정"
-
-            candidates.append({
-                "kind": "mixed_last",
-                "title": "대중교통 → 택시",
-                "subtitle": f"{split['name']}에서 택시 전환",
-                "time_min": total_mix_time,
-                "cost": total_mix_cost,
-                "distance_km": car_tail["distance_km"],
-                "walk_m": transit_summary["walk_m"],
-                "status": mix_status["text"],
-                "late": mix_status["late"],
-                "late_diff": mix_status["diff_min"],
-                "reason": reason,
-                "steps": transit_summary["steps"] + [f"{split['name']} → 목적지 택시 {car_tail['duration_min']}분"],
-                "split_name": split["name"],
-                "live_notes": transit_summary["live_notes"],
-                "taxi_time_min": car_tail["duration_min"],
-                "taxi_distance_km": car_tail["distance_km"],
-                "taxi_cost": car_tail["taxi_fare"],
-                "transit_time_min": transit_summary["time_min"],
-                "transit_cost": transit_summary["cost"],
-            })
-        except Exception:
+        transit_summary = path_to_summary(transit_to_split, start_offset_min=0)
+        if transit_summary is None:
             continue
+
+        total_mix_time = transit_summary["time_min"] + car_tail["duration_min"]
+        total_mix_cost = transit_summary["cost"] + car_tail["taxi_fare"]
+        mix_status = calc_arrival_status(total_mix_time, arrive_by)
+
+        reason = f"{split['name']}까지 대중교통 후 마지막 구간만 택시"
+        if transit_summary["bus_live_extra_min"] > 0:
+            reason += f" / 버스 실시간 대기 {transit_summary['bus_live_extra_min']}분 반영"
+        if transit_summary["subway_sched_delta_min"] != 0:
+            sign = "+" if transit_summary["subway_sched_delta_min"] > 0 else ""
+            reason += f" / 지하철 시간표 {sign}{transit_summary['subway_sched_delta_min']}분 보정"
+
+        candidates.append({
+            "kind": "mixed_last",
+            "title": "대중교통 → 택시",
+            "subtitle": f"{split['name']}에서 택시 전환",
+            "time_min": total_mix_time,
+            "cost": total_mix_cost,
+            "distance_km": car_tail["distance_km"],
+            "walk_m": transit_summary["walk_m"],
+            "status": mix_status["text"],
+            "late": mix_status["late"],
+            "late_diff": mix_status["diff_min"],
+            "reason": reason,
+            "steps": transit_summary["steps"] + [f"{split['name']} → 목적지 택시 {car_tail['duration_min']}분"],
+            "split_name": split["name"],
+            "live_notes": transit_summary["live_notes"],
+            "taxi_time_min": car_tail["duration_min"],
+            "taxi_distance_km": car_tail["distance_km"],
+            "taxi_cost": car_tail["taxi_fare"],
+            "transit_time_min": transit_summary["time_min"],
+            "transit_cost": transit_summary["cost"],
+        })
 
     # 중복 제거
     unique = []
@@ -1483,67 +1414,46 @@ def build_route_candidates(origin, destination, arrive_by):
         unique.append(c)
 
     taxi_only = next((c for c in unique if c["kind"] == "taxi"), None)
+    transit_cands = [c for c in unique if c["kind"] == "transit"]
+    best_transit = sorted(transit_cands, key=lambda x: (x["time_min"], x["cost"]))[0] if transit_cands else None
 
-    transit_candidates = [c for c in unique if c["kind"] == "transit"]
-    best_transit = None
-    if transit_candidates:
-        best_transit = sorted(
-            transit_candidates,
-            key=lambda x: (x["time_min"], x["cost"])
-        )[0]
-
-    filtered = [
-        c for c in unique
-        if mixed_is_reasonable(c, taxi_only, best_transit)
-    ]
-
+    filtered = [c for c in unique if mixed_is_reasonable(c, taxi_only, best_transit)]
     filtered = filter_dominated_candidates(filtered)
 
     return filtered
 
+
 # =========================================================
 # 정렬 / 추천
 # =========================================================
-def normalize_score(v, arr):
-    mn = min(arr)
-    mx = max(arr)
-    if mx == mn:
-        return 0.0
-    return (v - mn) / (mx - mn)
-
-
 def value_score(c, candidates, arrive_by=None):
-    late_penalty = 1 if c["late"] else 0
+    lp = late_penalty_continuous(c)
     kind_penalty = VALUE_KIND_PENALTY.get(c["kind"], 0)
-
     costs = [x["cost"] for x in candidates]
-    cost_norm = normalize_score(c["cost"], costs)
+    cost_norm = robust_normalize(c["cost"], costs)
 
     if not arrive_by:
         times = [x["time_min"] for x in candidates]
-        time_norm = normalize_score(c["time_min"], times)
-        return late_penalty + kind_penalty + (0.30 * cost_norm) + (0.70 * time_norm)
+        time_norm = robust_normalize(c["time_min"], times)
+        return lp + kind_penalty + (VALUE_COST_WEIGHT * cost_norm) + (VALUE_TIME_WEIGHT * time_norm)
 
-    urgency_values = []
-    for x in candidates:
-        late_diff = x.get("late_diff")
-        if x["late"]:
-            urgency = 1000 + abs(late_diff) if late_diff is not None else 1000
-        else:
-            slack = max(0, late_diff if late_diff is not None else 0)
-            urgency = max(0, ARRIVE_BUFFER_MIN - slack)
-        urgency_values.append(urgency)
-
-    my_late_diff = c.get("late_diff")
-    if c["late"]:
-        my_urgency = 1000 + abs(my_late_diff) if my_late_diff is not None else 1000
+    # arrive_by 모드: 지각/비지각 분리된 urgency
+    if not c["late"]:
+        slack = max(0, c.get("late_diff") or 0)
+        urgency = max(0, ARRIVE_BUFFER_MIN - min(slack, ARRIVE_BUFFER_MIN))
     else:
-        slack = max(0, my_late_diff if my_late_diff is not None else 0)
-        my_urgency = max(0, ARRIVE_BUFFER_MIN - slack)
+        urgency = ARRIVE_BUFFER_MIN
 
-    urgency_norm = normalize_score(my_urgency, urgency_values)
+    non_late = [x for x in candidates if not x["late"]]
+    urgency_pool = []
+    for x in (non_late if non_late else candidates):
+        s = max(0, (x.get("late_diff") or 0))
+        urgency_pool.append(max(0, ARRIVE_BUFFER_MIN - min(s, ARRIVE_BUFFER_MIN)))
 
-    return (1.5 * late_penalty) + kind_penalty + (0.75 * cost_norm) + (0.25 * urgency_norm)
+    urgency_norm = robust_normalize(urgency, urgency_pool) if urgency_pool else (1.0 if c["late"] else 0.0)
+
+    return lp + kind_penalty + (0.75 * cost_norm) + (0.25 * urgency_norm)
+
 
 def pick_best(candidates, priority, arrive_by=None):
     if not candidates:
@@ -1555,12 +1465,7 @@ def pick_best(candidates, priority, arrive_by=None):
     def ontime_key(c):
         if not c["late"]:
             return (0, c["time_min"], c["cost"])
-        return (
-            1,
-            abs(c["late_diff"]) if c["late_diff"] is not None else 999999,
-            c["time_min"],
-            c["cost"],
-        )
+        return (1, abs(c["late_diff"]) if c["late_diff"] is not None else 999999, c["time_min"], c["cost"])
 
     def value_key(c):
         return (
@@ -1607,11 +1512,17 @@ with col_d:
 if st.button("실제 혼합 경로 검색", use_container_width=True):
     if not origin_text or not destination_text:
         st.warning("출발지와 목적지를 입력해줘.")
+    elif origin_text.strip() == destination_text.strip():
+        st.warning("출발지와 목적지가 같아요.")
     else:
         try:
             with st.spinner("장소 검색 중..."):
                 origin = search_place(origin_text)
                 destination = search_place(destination_text)
+
+            if is_same_point(origin["x"], origin["y"], destination["x"], destination["y"]):
+                st.warning("출발지와 목적지 좌표가 동일해요.")
+                st.stop()
 
             with st.spinner("대중교통 / 택시 / 혼합 경로 계산 중..."):
                 all_candidates = build_route_candidates(origin, destination, arrive_by)
@@ -1625,7 +1536,7 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
             best_taxi = pick_best_by_kind(all_candidates, "taxi", priority, arrive_by=arrive_by)
             best_mixed_first = pick_best_by_kind(all_candidates, "mixed_first", priority, arrive_by=arrive_by)
             best_mixed_last = pick_best_by_kind(all_candidates, "mixed_last", priority, arrive_by=arrive_by)
-            
+
             st.success(f"{origin['name']} → {destination['name']} 추천 결과")
 
             if best_overall:
@@ -1676,7 +1587,6 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
             for label, route in compare_routes:
                 if route is None:
                     continue
-
                 with st.container(border=True):
                     st.markdown(f"### {label}")
                     if route.get("subtitle"):
@@ -1733,7 +1643,6 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                         taxi_time = safe_int(c.get("taxi_time_min"), 0)
                         total_time = max(safe_int(c.get("time_min"), 1), 1)
                         taxi_share = round(taxi_time / total_time * 100)
-
                         st.write(
                             f"{i}. [{c['title']}] {c.get('subtitle', '')} | "
                             f"{c['time_min']}분 | {fmt_won(c['cost'])} | "
@@ -1756,7 +1665,6 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                         total_time = max(safe_int(c.get("time_min"), 1), 1)
                         taxi_share = round(taxi_time / total_time * 100)
                         extra = f" | 🚕 비중 {taxi_share}%"
-
                     st.write(
                         f"{i}. [{c['kind']}] {c['title']}"
                         f"{' / ' + c['subtitle'] if c.get('subtitle') else ''}"
