@@ -27,9 +27,9 @@ REALTIME_BUS_WAIT_CAP_MIN = 15
 REALTIME_SUBWAY_SCHEDULE_ENABLED = True
 SUBWAY_SCHEDULE_CACHE_TTL = 30
 
-# 가성비 점수
-VALUE_COST_WEIGHT = 0.60
-VALUE_TIME_WEIGHT = 0.40
+# 가성비 점수 (시간의 가치를 비용보다 높게 평가)
+VALUE_COST_WEIGHT = 0.30  # 비용 민감도 대폭 하향
+VALUE_TIME_WEIGHT = 0.70  # 시간 단축 메리트 상향
 
 VALUE_KIND_PENALTY = {
     "transit": 0.03,
