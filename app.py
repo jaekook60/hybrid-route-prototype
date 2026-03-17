@@ -380,7 +380,12 @@ def get_car_summary(origin_x, origin_y, dest_x, dest_y):
         "toll_fare": safe_int(fare.get("toll", 0)),
     }
 
-
+def valid_taxi_leg(car):
+    return (
+        car["duration_min"] >= MIN_TAXI_MIN
+        or car["distance_km"] >= MIN_TAXI_KM
+        or car["taxi_fare"] >= MIN_TAXI_FARE
+    )
 # =========================================================
 # ODsay 실시간 버스
 # =========================================================
