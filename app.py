@@ -1248,9 +1248,7 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                             for note in c["live_notes"][:3]:
                                 st.write(f"   - {note}")
 
-       # --- (위쪽 코드 생략: mixed_all_sorted 부분 등) ---
-
-            # 방금 수정한 디버깅용 전체 후보 보기
+   # 방금 수정한 디버깅용 전체 후보 보기
             with st.expander("전체 후보 보기 (점수 디버깅)"):
                 all_sorted = sorted(
                     all_candidates,
@@ -1264,14 +1262,6 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                         f" | ⏳ {c['time_min']}분 | 💸 {fmt_won(c['cost'])}"
                         f" | 🎯 점수: {score:.3f} | {c['status']}"
                     )
-
-            st.caption("버스 실시간 값이 잡히면 대기시간을 더하고, 지하철 구간은 시간표 기반 경로검색으로 보정해요. 정보가 없으면 기본 경로값으로 fallback 합니다.")
-
-        # 🚨 여기서부터가 핵심! try와 짝꿍인 except가 이 위치(들여쓰기)에 꼭 있어야 합니다!
-        except Exception as e:
-            st.error(f"오류: {e}")
-            with st.expander("에러 상세 보기"):
-                st.exception(e)
 
             st.caption("버스 실시간 값이 잡히면 대기시간을 더하고, 지하철 구간은 시간표 기반 경로검색으로 보정해요. 정보가 없으면 기본 경로값으로 fallback 합니다.")
 
