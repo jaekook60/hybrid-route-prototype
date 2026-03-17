@@ -19,6 +19,7 @@ DIRECT_STOP_EXTRA_FARE_ALLOW = 3000  # 시간이 더 좋아지면 3천원까지 
 MIN_TAXI_MIN = 4
 MIN_TAXI_KM = 1.5
 MIN_TAXI_FARE = 5000
+ARRIVE_BUFFER_MIN = 15   # 15분 이상 여유 있으면 '충분히 제시간'으로 간주
 
 # 버스 실시간 반영
 REALTIME_BUS_ENABLED = True
@@ -1496,31 +1497,53 @@ def build_route_candidates(origin, destination, arrive_by):
 # =========================================================
 # 정렬 / 추천
 # =========================================================
-def value_score(c, candidates):
-    costs = [x["cost"] for x in candidates]
-    times = [x["time_min"] for x in candidates]
+def normalize_score(v, arr):
+    mn = min(arr)
+    mx = max(arr)
+    if mx == mn:
+        return 0.0
+    return (v - mn) / (mx - mn)
 
-    min_cost, max_cost = min(costs), max(costs)
-    min_time, max_time = min(times), max(times)
 
-    if max_cost == min_cost:
-        cost_norm = 0
-    else:
-        cost_norm = (c["cost"] - min_cost) / (max_cost - min_cost)
-
-    if max_time == min_time:
-        time_norm = 0
-    else:
-        time_norm = (c["time_min"] - min_time) / (max_time - min_time)
-
+def value_score(c, candidates, arrive_by=None):
     late_penalty = 1 if c["late"] else 0
     kind_penalty = VALUE_KIND_PENALTY.get(c["kind"], 0)
 
-    score = late_penalty + kind_penalty + (VALUE_COST_WEIGHT * cost_norm) + (VALUE_TIME_WEIGHT * time_norm)
-    return score
+    costs = [x["cost"] for x in candidates]
+    cost_norm = normalize_score(c["cost"], costs)
+
+    # 도착 희망 시간이 없으면 기존처럼 시간/비용 혼합
+    if not arrive_by:
+        times = [x["time_min"] for x in candidates]
+        time_norm = normalize_score(c["time_min"], times)
+        return late_penalty + kind_penalty + (0.30 * cost_norm) + (0.70 * time_norm)
+
+    # 도착 희망 시간이 있으면:
+    # 1) 늦는 후보는 강하게 불이익
+    # 2) 제시간 후보는 "얼마나 더 빨리 도착하느냐"보다
+    #    "여유가 충분한가"만 보고, 충분하면 비용 중심으로 비교
+    urgency_values = []
+    for x in candidates:
+        if x["late"]:
+            urgency = 1000 + abs(x["late_diff"]) if x["late_diff"] is not None else 1000
+        else:
+            slack = max(0, x["diff_min"] if x["diff_min"] is not None else 0)
+            urgency = max(0, ARRIVE_BUFFER_MIN - slack)
+        urgency_values.append(urgency)
+
+    if c["late"]:
+        my_urgency = 1000 + abs(c["late_diff"]) if c["late_diff"] is not None else 1000
+    else:
+        slack = max(0, c["diff_min"] if c["diff_min"] is not None else 0)
+        my_urgency = max(0, ARRIVE_BUFFER_MIN - slack)
+
+    urgency_norm = normalize_score(my_urgency, urgency_values)
+
+    # 도착 희망 시간이 있을 때는 비용 중심
+    return (1.5 * late_penalty) + kind_penalty + (0.75 * cost_norm) + (0.25 * urgency_norm)
 
 
-def pick_best(candidates, priority):
+def pick_best(candidates, priority, arrive_by=None):
     if not candidates:
         return None
 
@@ -1532,8 +1555,8 @@ def pick_best(candidates, priority):
             return (0, c["time_min"], c["cost"])
         return (1, abs(c["late_diff"]) if c["late_diff"] is not None else 999999, c["time_min"], c["cost"])
 
-    def value_key(c):
-        return (value_score(c, candidates), c["cost"], c["time_min"])
+   def value_key(c):
+    return (value_score(c, candidates, arrive_by=arrive_by), c["cost"], c["time_min"])
 
     if priority == "최저비용":
         return sorted(candidates, key=cost_key)[0]
@@ -1543,11 +1566,11 @@ def pick_best(candidates, priority):
         return sorted(candidates, key=value_key)[0]
 
 
-def pick_best_by_kind(candidates, kind, priority):
+def pick_best_by_kind(candidates, kind, priority, arrive_by=None):
     subset = [c for c in candidates if c["kind"] == kind]
     if not subset:
         return None
-    return pick_best(subset, priority)
+    return pick_best(subset, priority, arrive_by=arrive_by))
 
 
 # =========================================================
@@ -1584,12 +1607,12 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                 st.error("경로를 만들지 못했어.")
                 st.stop()
 
-            best_overall = pick_best(all_candidates, priority)
-            best_transit = pick_best_by_kind(all_candidates, "transit", priority)
-            best_taxi = pick_best_by_kind(all_candidates, "taxi", priority)
-            best_mixed_first = pick_best_by_kind(all_candidates, "mixed_first", priority)
-            best_mixed_last = pick_best_by_kind(all_candidates, "mixed_last", priority)
-
+            best_overall = pick_best(all_candidates, priority, arrive_by=arrive_by)
+            best_transit = pick_best_by_kind(all_candidates, "transit", priority, arrive_by=arrive_by)
+            best_taxi = pick_best_by_kind(all_candidates, "taxi", priority, arrive_by=arrive_by)
+            best_mixed_first = pick_best_by_kind(all_candidates, "mixed_first", priority, arrive_by=arrive_by)
+            best_mixed_last = pick_best_by_kind(all_candidates, "mixed_last", priority, arrive_by=arrive_by)
+            
             st.success(f"{origin['name']} → {destination['name']} 추천 결과")
 
             if best_overall:
