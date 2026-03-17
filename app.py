@@ -1,5 +1,6 @@
 import math
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -71,6 +72,11 @@ except Exception:
     KAKAO_REST_API_KEY = st.secrets["KAKAO_LOCAL_REST_KEY"]
 
 ODSAY_API_KEY = st.secrets["ODSAY_API_KEY"]
+
+KST = ZoneInfo("Asia/Seoul")
+
+def now_kst():
+    return datetime.now(KST)
 
 # =========================================================
 # 공통 유틸
@@ -218,7 +224,7 @@ def parse_arrive_by(arrive_by: str):
         return None
     try:
         hh, mm = map(int, arrive_by.strip().split(":"))
-        now = datetime.now()
+        now = now_kst()
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target < now:
             target += timedelta(days=1)
@@ -232,8 +238,10 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
     if target is None:
         return {"text": "시간 비교 안 함", "late": False, "diff_min": None}
 
+    now = now_kst()
+
     recommend_depart = target - timedelta(minutes=total_time_min)
-    eta_if_leave_now = datetime.now() + timedelta(minutes=total_time_min)
+    eta_if_leave_now = now + timedelta(minutes=total_time_min)
     diff_if_leave_now = math.floor((target - eta_if_leave_now).total_seconds() / 60)
 
     if diff_if_leave_now >= 0:
@@ -252,8 +260,7 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
 
 
 def current_day_code():
-    # ODsay DAY: 1 평일, 2 토요일, 3 공휴일/일요일
-    wd = datetime.now().weekday()  # Mon=0 ... Sun=6
+    wd = now_kst().weekday()  # Mon=0 ... Sun=6
     if wd == 5:
         return 2
     if wd == 6:
@@ -262,7 +269,7 @@ def current_day_code():
 
 
 def hhmm_after_offset(offset_min=0):
-    t = datetime.now() + timedelta(minutes=offset_min)
+    t = now_kst() + timedelta(minutes=offset_min)
     return t.strftime("%H%M")
 
 
@@ -1512,16 +1519,11 @@ def value_score(c, candidates, arrive_by=None):
     costs = [x["cost"] for x in candidates]
     cost_norm = normalize_score(c["cost"], costs)
 
-    # 도착 희망 시간이 없으면 기존처럼 시간/비용 혼합
     if not arrive_by:
         times = [x["time_min"] for x in candidates]
         time_norm = normalize_score(c["time_min"], times)
         return late_penalty + kind_penalty + (0.30 * cost_norm) + (0.70 * time_norm)
 
-    # 도착 희망 시간이 있으면:
-    # 1) 늦는 후보는 강하게 불이익
-    # 2) 제시간 후보는 "얼마나 더 빨리 도착하느냐"보다
-    #    "여유가 충분한가"만 보고, 충분하면 비용 중심으로 비교
     urgency_values = []
     for x in candidates:
         late_diff = x.get("late_diff")
@@ -1541,9 +1543,7 @@ def value_score(c, candidates, arrive_by=None):
 
     urgency_norm = normalize_score(my_urgency, urgency_values)
 
-    # 도착 희망 시간이 있을 때는 비용 중심
     return (1.5 * late_penalty) + kind_penalty + (0.75 * cost_norm) + (0.25 * urgency_norm)
-
 
 def pick_best(candidates, priority, arrive_by=None):
     if not candidates:
@@ -1564,6 +1564,8 @@ def pick_best(candidates, priority, arrive_by=None):
 
     def value_key(c):
         return (
+            1 if c["late"] else 0,
+            abs(c["late_diff"]) if c.get("late_diff") is not None and c["late"] else 0,
             value_score(c, candidates, arrive_by=arrive_by),
             c["cost"],
             c["time_min"],
