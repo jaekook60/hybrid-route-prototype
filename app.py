@@ -108,20 +108,28 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
     if target is None:
         return {"text": "시간 비교 안 함", "late": False, "diff_min": None}
 
-    eta = datetime.now() + timedelta(minutes=total_time_min)
-    diff = math.floor((target - eta).total_seconds() / 60)
+    # 1. 도착 희망 시간에서 총 소요 시간을 빼서 '언제 출발해야 하는지' 역산
+    recommend_depart = target - timedelta(minutes=total_time_min)
+    
+    # 2. 지금 당장 출발했을 때의 도착 시간 비교 (지각 여부 판별용)
+    eta_if_leave_now = datetime.now() + timedelta(minutes=total_time_min)
+    diff_if_leave_now = math.floor((target - eta_if_leave_now).total_seconds() / 60)
 
-    if diff >= 0:
-        return {"text": f"제시간 도착 (+{diff}분 여유)", "late": False, "diff_min": diff}
-    return {"text": f"{abs(diff)}분 늦음", "late": True, "diff_min": diff}
-
-
-def valid_taxi_leg(car):
-    return (
-        car["duration_min"] >= MIN_TAXI_MIN
-        and car["distance_km"] >= MIN_TAXI_KM
-        and car["taxi_fare"] >= MIN_TAXI_FARE
-    )
+    if diff_if_leave_now >= 0:
+        # 지각이 아니면 '출발 권장 시간'을 깔끔하게 보여줌
+        depart_str = recommend_depart.strftime("%H:%M")
+        return {
+            "text": f"제시간 도착 (권장 출발: {depart_str})", 
+            "late": False, 
+            "diff_min": diff_if_leave_now
+        }
+    else:
+        # 지금 당장 출발해도 늦는 경우
+        return {
+            "text": f"{abs(diff_if_leave_now)}분 지각 (지금 당장 출발해도 늦음!)", 
+            "late": True, 
+            "diff_min": diff_if_leave_now
+        }
 
 
 def current_day_code():
