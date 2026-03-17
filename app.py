@@ -12,7 +12,7 @@ st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layou
 MAX_TRANSIT_PATHS = 6
 MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
-
+MAX_INTERMEDIATE_CANDIDATES = 40
 # 너무 짧은 택시 구간 제거
 MIN_TAXI_MIN = 4
 MIN_TAXI_KM = 1.5
@@ -891,12 +891,121 @@ def path_to_summary(path, start_offset_min=0):
         "steps": summarize_subpaths(subpaths),
         "live_notes": bus_live.get("notes", []) + subway_sched.get("notes", []),
     }
+def normalize_candidate_point(name, x, y):
+    if not name:
+        return None
 
+    x = safe_float(x, None)
+    y = safe_float(y, None)
+
+    if x is None or y is None:
+        return None
+
+    return {
+        "name": str(name),
+        "x": x,
+        "y": y,
+    }
+
+
+def get_pass_stop_points(sp):
+    """
+    ODsay subPath 안의 passStopList에서 중간 정류장/역 후보를 뽑는다.
+    버스/지하철 응답 구조가 조금 달라도 최대한 유연하게 처리.
+    """
+    if not isinstance(sp, dict):
+        return []
+
+    pass_stop_list = sp.get("passStopList")
+    if not isinstance(pass_stop_list, dict):
+        return []
+
+    raw_items = None
+    for key in ["stations", "station", "list", "items"]:
+        val = pass_stop_list.get(key)
+        if isinstance(val, list):
+            raw_items = val
+            break
+
+    if not isinstance(raw_items, list):
+        return []
+
+    points = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        name = first_non_none(
+            item,
+            ["stationName", "name", "stopName", "startName", "endName"],
+            None,
+        )
+        x = first_non_none(
+            item,
+            ["x", "X", "gpsX", "lon", "lng", "longitude"],
+            None,
+        )
+        y = first_non_none(
+            item,
+            ["y", "Y", "gpsY", "lat", "latitude"],
+            None,
+        )
+
+        p = normalize_candidate_point(name, x, y)
+        if p is not None:
+            points.append(p)
+
+    return points
+
+
+def collect_subpath_points(sp):
+    """
+    한 subPath에서 start / passStopList / end 를 모두 모은다.
+    """
+    if not isinstance(sp, dict):
+        return []
+
+    points = []
+
+    start_p = normalize_candidate_point(
+        sp.get("startName"),
+        sp.get("startX"),
+        sp.get("startY"),
+    )
+    if start_p is not None:
+        points.append(start_p)
+
+    points.extend(get_pass_stop_points(sp))
+
+    end_p = normalize_candidate_point(
+        sp.get("endName"),
+        sp.get("endX"),
+        sp.get("endY"),
+    )
+    if end_p is not None:
+        points.append(end_p)
+
+    # 중복 제거
+    dedup = []
+    seen = set()
+    for p in points:
+        key = (round(p["x"], 6), round(p["y"], 6), p["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
+
+    return dedup
 
 # =========================================================
 # 후보 지점 추출
 # =========================================================
 def extract_board_candidates(paths, origin):
+    """
+    출발지에서 택시를 타고 갈 '탑승 후보'를 추출.
+    기존: 각 subPath의 start만
+    변경: start + 중간 정류장/역 + end 전부 후보화
+    """
     candidates = []
     seen = set()
 
@@ -905,41 +1014,39 @@ def extract_board_candidates(paths, origin):
             continue
 
         subpaths = path.get("subPath", [])
+        if not isinstance(subpaths, list):
+            continue
+
         for sp in subpaths:
             if not isinstance(sp, dict):
                 continue
+
             traffic_type = sp.get("trafficType")
-            if traffic_type not in (1, 2):
+            if traffic_type not in (1, 2):  # 지하철/버스만
                 continue
 
-            sx = sp.get("startX")
-            sy = sp.get("startY")
-            sn = sp.get("startName")
+            points = collect_subpath_points(sp)
 
-            if sx is None or sy is None or not sn:
-                continue
+            for p in points:
+                if is_same_point(p["x"], p["y"], origin["x"], origin["y"]):
+                    continue
 
-            x = safe_float(sx)
-            y = safe_float(sy)
+                key = (round(p["x"], 6), round(p["y"], 6), p["name"])
+                if key in seen:
+                    continue
+                seen.add(key)
 
-            if is_same_point(x, y, origin["x"], origin["y"]):
-                continue
+                candidates.append(p)
 
-            key = (round(x, 6), round(y, 6), sn)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            candidates.append({
-                "name": sn,
-                "x": x,
-                "y": y,
-            })
-
-    return candidates[:MAX_CANDIDATE_POINTS]
+    return candidates[:MAX_INTERMEDIATE_CANDIDATES]
 
 
 def extract_split_candidates(paths, destination):
+    """
+    목적지 직전에 택시로 전환할 '하차 후보'를 추출.
+    기존: 각 subPath의 end만
+    변경: start + 중간 정류장/역 + end 전부 후보화
+    """
     candidates = []
     seen = set()
 
@@ -948,38 +1055,31 @@ def extract_split_candidates(paths, destination):
             continue
 
         subpaths = path.get("subPath", [])
+        if not isinstance(subpaths, list):
+            continue
+
         for sp in subpaths:
             if not isinstance(sp, dict):
                 continue
+
             traffic_type = sp.get("trafficType")
             if traffic_type not in (1, 2):
                 continue
 
-            ex = sp.get("endX")
-            ey = sp.get("endY")
-            en = sp.get("endName")
+            points = collect_subpath_points(sp)
 
-            if ex is None or ey is None or not en:
-                continue
+            for p in points:
+                if is_same_point(p["x"], p["y"], destination["x"], destination["y"]):
+                    continue
 
-            x = safe_float(ex)
-            y = safe_float(ey)
+                key = (round(p["x"], 6), round(p["y"], 6), p["name"])
+                if key in seen:
+                    continue
+                seen.add(key)
 
-            if is_same_point(x, y, destination["x"], destination["y"]):
-                continue
+                candidates.append(p)
 
-            key = (round(x, 6), round(y, 6), en)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            candidates.append({
-                "name": en,
-                "x": x,
-                "y": y,
-            })
-
-    return candidates[:MAX_CANDIDATE_POINTS]
+    return candidates[:MAX_INTERMEDIATE_CANDIDATES]
 
 
 # =========================================================
