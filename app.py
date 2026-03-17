@@ -14,9 +14,9 @@ MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
 
 # 너무 짧은 택시 구간 제거
-MIN_TAXI_MIN = 2
-MIN_TAXI_KM = 3
-
+MIN_TAXI_MIN = 4
+MIN_TAXI_KM = 1.5
+MIN_TAXI_FARE = 5000
 
 # 버스 실시간 반영
 REALTIME_BUS_ENABLED = True
@@ -27,16 +27,37 @@ REALTIME_BUS_WAIT_CAP_MIN = 15
 REALTIME_SUBWAY_SCHEDULE_ENABLED = True
 SUBWAY_SCHEDULE_CACHE_TTL = 30
 
-# 가성비 점수 (시간의 가치를 비용보다 높게 평가)
-VALUE_COST_WEIGHT = 0.30  # 비용 민감도 대폭 하향
-VALUE_TIME_WEIGHT = 0.70  # 시간 단축 메리트 상향
+# 가성비 점수
+VALUE_COST_WEIGHT = 0.30
+VALUE_TIME_WEIGHT = 0.70
 
 VALUE_KIND_PENALTY = {
     "transit": 0.03,
-    "mixed_first": 0.00,   # 택시 -> 대중교통
-    "mixed_last": 0.00,    # 대중교통 -> 택시
+    "mixed_first": 0.00,
+    "mixed_last": 0.00,
     "taxi": 0.12,
 }
+
+# =========================================================
+# 혼합 후보 필터 기준
+# =========================================================
+# 택시만이랑 거의 비슷한 혼합인데, 이점이 없으면 제거
+MIXED_NEAR_TAXI_MIN_COST_SAVE = 5000   # 택시만보다 최소 5천원은 싸야 의미 있음
+MIXED_NEAR_TAXI_MIN_TIME_SAVE = 6      # 택시만보다 최소 6분 빨라야 의미 있음
+
+# 대중교통보다 충분히 빨라지면 살림
+MIXED_KEEP_TIME_SAVE_VS_TRANSIT = 12
+MIXED_MAX_EXTRA_COST_VS_TRANSIT = 20000
+
+# 혼합인데 택시 비중이 너무 큰 경우 "거의 택시만"으로 봄
+MIXED_HIGH_TAXI_SHARE = 0.75
+MIXED_HIGH_TAXI_KM = 20.0
+
+# =========================================================
+# ODsay Referer
+# 배포 주소가 바뀌면 여기만 바꿔
+# =========================================================
+ODSAY_REFERER = "https://hybrid-route-prototype-kmwass9s4mjky8yrgn78la.streamlit.app/"
 
 # =========================================================
 # Secrets
@@ -53,6 +74,12 @@ ODSAY_API_KEY = st.secrets["ODSAY_API_KEY"]
 # =========================================================
 def kakao_headers():
     return {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
+
+
+def odsay_headers():
+    if ODSAY_REFERER:
+        return {"Referer": ODSAY_REFERER}
+    return {}
 
 
 def fmt_won(v):
@@ -108,28 +135,23 @@ def calc_arrival_status(total_time_min: int, arrive_by: str):
     if target is None:
         return {"text": "시간 비교 안 함", "late": False, "diff_min": None}
 
-    # 1. 도착 희망 시간에서 총 소요 시간을 빼서 '언제 출발해야 하는지' 역산
     recommend_depart = target - timedelta(minutes=total_time_min)
-    
-    # 2. 지금 당장 출발했을 때의 도착 시간 비교 (지각 여부 판별용)
     eta_if_leave_now = datetime.now() + timedelta(minutes=total_time_min)
     diff_if_leave_now = math.floor((target - eta_if_leave_now).total_seconds() / 60)
 
     if diff_if_leave_now >= 0:
-        # 지각이 아니면 '출발 권장 시간'을 깔끔하게 보여줌
         depart_str = recommend_depart.strftime("%H:%M")
         return {
-            "text": f"제시간 도착 (권장 출발: {depart_str})", 
-            "late": False, 
-            "diff_min": diff_if_leave_now
+            "text": f"제시간 도착 (권장 출발: {depart_str})",
+            "late": False,
+            "diff_min": diff_if_leave_now,
         }
-    else:
-        # 지금 당장 출발해도 늦는 경우
-        return {
-            "text": f"{abs(diff_if_leave_now)}분 지각 (지금 당장 출발해도 늦음!)", 
-            "late": True, 
-            "diff_min": diff_if_leave_now
-        }
+
+    return {
+        "text": f"{abs(diff_if_leave_now)}분 지각 (지금 당장 출발해도 늦음!)",
+        "late": True,
+        "diff_min": diff_if_leave_now,
+    }
 
 
 def current_day_code():
@@ -237,14 +259,7 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
         "output": "json",
     }
 
-    # 1. 👇 이 부분을 새로 추가해 (로컬 테스트용이면 localhost)
-    headers = {
-        "Referer": "https://hybrid-route-prototype-kmwass9s4mjky8yrgn78la.streamlit.app/" 
-    }
-
-    # 2. 👇 requests.get 안에 headers=headers 를 추가해
-    r = requests.get(url, params=params, headers=headers, timeout=20)
-    
+    r = requests.get(url, params=params, headers=odsay_headers(), timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -300,7 +315,7 @@ def get_subway_path_schedule(sid, eid, mode=1, day=1, time_hhmm=None, mid=None):
         "apiKey": ODSAY_API_KEY,
         "SID": sid,
         "EID": eid,
-        "MODE": mode,   # 1: 출발시간 기준
+        "MODE": mode,
         "DAY": day,
         "output": "json",
     }
@@ -309,7 +324,7 @@ def get_subway_path_schedule(sid, eid, mode=1, day=1, time_hhmm=None, mid=None):
     if mid is not None:
         params["MID"] = mid
 
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, headers=odsay_headers(), timeout=15)
     r.raise_for_status()
     data = r.json()
 
@@ -380,12 +395,93 @@ def get_car_summary(origin_x, origin_y, dest_x, dest_y):
         "toll_fare": safe_int(fare.get("toll", 0)),
     }
 
+
 def valid_taxi_leg(car):
+    # 너무 짧은 택시 구간만 제거
     return (
-        car["duration_min"] >= MIN_TAXI_MIN
-        or car["distance_km"] >= MIN_TAXI_KM
-        or car["taxi_fare"] >= MIN_TAXI_FARE
+        safe_int(car.get("duration_min"), 0) >= MIN_TAXI_MIN
+        or safe_float(car.get("distance_km"), 0.0) >= MIN_TAXI_KM
+        or safe_int(car.get("taxi_fare"), 0) >= MIN_TAXI_FARE
     )
+
+
+def is_dominated(a, b):
+    # b가 a보다 시간/비용 둘 다 같거나 더 좋고, 하나 이상 엄격히 좋으면 a는 지배당함
+    return (
+        b["time_min"] <= a["time_min"]
+        and b["cost"] <= a["cost"]
+        and (b["time_min"] < a["time_min"] or b["cost"] < a["cost"])
+    )
+
+
+def filter_dominated_candidates(candidates):
+    kept = []
+    for i, a in enumerate(candidates):
+        dominated = False
+        for j, b in enumerate(candidates):
+            if i == j:
+                continue
+            if is_dominated(a, b):
+                dominated = True
+                break
+        if not dominated:
+            kept.append(a)
+    return kept
+
+
+def mixed_is_reasonable(candidate, taxi_only, best_transit):
+    if candidate.get("kind") not in ("mixed_first", "mixed_last"):
+        return True
+
+    total_time = safe_int(candidate.get("time_min"), 0)
+    total_cost = safe_int(candidate.get("cost"), 0)
+
+    taxi_time = safe_int(candidate.get("taxi_time_min"), 0)
+    taxi_km = safe_float(candidate.get("taxi_distance_km"), 0.0)
+    taxi_share = taxi_time / max(total_time, 1)
+
+    cost_save_vs_taxi = None
+    time_save_vs_taxi = None
+    if taxi_only is not None:
+        cost_save_vs_taxi = taxi_only["cost"] - total_cost
+        time_save_vs_taxi = taxi_only["time_min"] - total_time
+
+    time_save_vs_transit = None
+    extra_cost_vs_transit = None
+    if best_transit is not None:
+        time_save_vs_transit = best_transit["time_min"] - total_time
+        extra_cost_vs_transit = total_cost - best_transit["cost"]
+
+    # 1) 택시만보다 충분히 싸면 유지
+    if cost_save_vs_taxi is not None and cost_save_vs_taxi >= MIXED_NEAR_TAXI_MIN_COST_SAVE:
+        return True
+
+    # 2) 택시만보다 충분히 빠르면 유지
+    if time_save_vs_taxi is not None and time_save_vs_taxi >= MIXED_NEAR_TAXI_MIN_TIME_SAVE:
+        return True
+
+    # 3) 대중교통보다 충분히 빠르고 추가비용이 과하지 않으면 유지
+    if time_save_vs_transit is not None and time_save_vs_transit >= MIXED_KEEP_TIME_SAVE_VS_TRANSIT:
+        if extra_cost_vs_transit is None or extra_cost_vs_transit <= MIXED_MAX_EXTRA_COST_VS_TRANSIT:
+            return True
+
+    # 4) 대중교통은 지각인데 혼합은 제시간이면 유지
+    if best_transit is not None and best_transit.get("late") and not candidate.get("late"):
+        return True
+
+    # 5) 거의 택시만 수준인데 이점이 없으면 제거
+    if taxi_share >= MIXED_HIGH_TAXI_SHARE or taxi_km >= MIXED_HIGH_TAXI_KM:
+        if cost_save_vs_taxi is not None and time_save_vs_taxi is not None:
+            # 택시만보다 충분히 안 싸고, 충분히 안 빠르면 제거
+            if (
+                cost_save_vs_taxi < MIXED_NEAR_TAXI_MIN_COST_SAVE
+                and time_save_vs_taxi < MIXED_NEAR_TAXI_MIN_TIME_SAVE
+            ):
+                return False
+
+    return True
+
+
 # =========================================================
 # ODsay 실시간 버스
 # =========================================================
@@ -417,7 +513,7 @@ def get_realtime_station(station_id):
         "stationID": station_id,
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, headers=odsay_headers(), timeout=10)
         r.raise_for_status()
         data = r.json()
         err_msg = parse_odsay_error(data) if isinstance(data, dict) else None
@@ -436,7 +532,7 @@ def get_realtime_route(bus_id):
         "busID": bus_id,
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, headers=odsay_headers(), timeout=10)
         r.raise_for_status()
         data = r.json()
         err_msg = parse_odsay_error(data) if isinstance(data, dict) else None
@@ -586,8 +682,6 @@ def compute_transit_live_adjustment(path, start_offset_min=0):
     if not REALTIME_BUS_ENABLED or not isinstance(path, dict):
         return {"extra_wait_min": 0, "notes": []}
 
-    # 택시 후 대중교통처럼 몇 분 뒤 탑승하는 경우
-    # 현재 버스 실시간 예측을 그대로 더하면 오히려 오차가 커질 수 있어
     if start_offset_min > 0:
         return {"extra_wait_min": 0, "notes": []}
 
@@ -642,11 +736,6 @@ def extract_subway_line_name(sp):
 
 
 def compute_subway_schedule_adjustment(path, start_offset_min=0):
-    """
-    path의 각 지하철 구간에 대해 subwayPathSchedule로 시간표 기반 보정
-    - 지하철 구간 시간(sectionTime)을 시간표 기준 totalTime으로 대체
-    - 차이(delta)만 총 경로 시간에 가산
-    """
     if not REALTIME_SUBWAY_SCHEDULE_ENABLED or not isinstance(path, dict):
         return {"delta_min": 0, "notes": []}
 
@@ -926,6 +1015,9 @@ def build_route_candidates(origin, destination, arrive_by):
             continue
 
         summary = path_to_summary(path, start_offset_min=0)
+        if summary is None:
+            continue
+
         transit_status = calc_arrival_status(summary["time_min"], arrive_by)
 
         reason = "가장 저렴한 선택지에 가까움"
@@ -993,6 +1085,12 @@ def build_route_candidates(origin, destination, arrive_by):
                 "steps": [f"출발지 → {board['name']} 택시 {car_head['duration_min']}분"] + transit_summary["steps"],
                 "board_name": board["name"],
                 "live_notes": transit_summary["live_notes"],
+
+                "taxi_time_min": car_head["duration_min"],
+                "taxi_distance_km": car_head["distance_km"],
+                "taxi_cost": car_head["taxi_fare"],
+                "transit_time_min": transit_summary["time_min"],
+                "transit_cost": transit_summary["cost"],
             })
         except Exception:
             continue
@@ -1039,6 +1137,12 @@ def build_route_candidates(origin, destination, arrive_by):
                 "steps": transit_summary["steps"] + [f"{split['name']} → 목적지 택시 {car_tail['duration_min']}분"],
                 "split_name": split["name"],
                 "live_notes": transit_summary["live_notes"],
+
+                "taxi_time_min": car_tail["duration_min"],
+                "taxi_distance_km": car_tail["distance_km"],
+                "taxi_cost": car_tail["taxi_fare"],
+                "transit_time_min": transit_summary["time_min"],
+                "transit_cost": transit_summary["cost"],
             })
         except Exception:
             continue
@@ -1053,7 +1157,21 @@ def build_route_candidates(origin, destination, arrive_by):
         seen.add(key)
         unique.append(c)
 
-    return unique
+    # 기준 후보
+    taxi_only = next((c for c in unique if c["kind"] == "taxi"), None)
+
+    transit_candidates = [c for c in unique if c["kind"] == "transit"]
+    best_transit = None
+    if transit_candidates:
+        best_transit = sorted(transit_candidates, key=lambda x: (x["time_min"], x["cost"]))[0]
+
+    # 애매한 혼합 제거
+    filtered = [c for c in unique if mixed_is_reasonable(c, taxi_only, best_transit)]
+
+    # 시간/비용 둘 다 밀리는 후보 제거
+    filtered = filter_dominated_candidates(filtered)
+
+    return filtered
 
 
 # =========================================================
@@ -1177,6 +1295,12 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
 
                     st.write(f"추천 이유: {best_overall['reason']}")
 
+                    if best_overall["kind"] in ("mixed_first", "mixed_last"):
+                        taxi_time = safe_int(best_overall.get("taxi_time_min"), 0)
+                        total_time = max(safe_int(best_overall.get("time_min"), 1), 1)
+                        taxi_share = round(taxi_time / total_time * 100)
+                        st.write(f"택시 비중: {taxi_share}%")
+
                     if best_overall.get("live_notes"):
                         st.write("실시간/시간표 정보")
                         for note in best_overall["live_notes"][:6]:
@@ -1225,6 +1349,12 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                             f"지하철 {route.get('subway_transit_count', 0)}회"
                         )
 
+                    if route["kind"] in ("mixed_first", "mixed_last"):
+                        taxi_time = safe_int(route.get("taxi_time_min"), 0)
+                        total_time = max(safe_int(route.get("time_min"), 1), 1)
+                        taxi_share = round(taxi_time / total_time * 100)
+                        st.write(f"택시 비중: {taxi_share}%")
+
                     if route.get("live_notes"):
                         st.write("실시간/시간표 정보")
                         for note in route["live_notes"][:6]:
@@ -1245,15 +1375,19 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                     st.write("혼합 후보가 아직 생성되지 않았어.")
                 else:
                     for i, c in enumerate(mixed_all_sorted[:MAX_MIXED_CARDS], start=1):
+                        taxi_time = safe_int(c.get("taxi_time_min"), 0)
+                        total_time = max(safe_int(c.get("time_min"), 1), 1)
+                        taxi_share = round(taxi_time / total_time * 100)
+
                         st.write(
                             f"{i}. [{c['title']}] {c.get('subtitle', '')} | "
-                            f"{c['time_min']}분 | {fmt_won(c['cost'])} | {c['status']}"
+                            f"{c['time_min']}분 | {fmt_won(c['cost'])} | "
+                            f"택시비중 {taxi_share}% | {c['status']}"
                         )
                         if c.get("live_notes"):
                             for note in c["live_notes"][:3]:
                                 st.write(f"   - {note}")
 
-   # 방금 수정한 디버깅용 전체 후보 보기
             with st.expander("전체 후보 보기 (점수 디버깅)"):
                 all_sorted = sorted(
                     all_candidates,
@@ -1261,10 +1395,18 @@ if st.button("실제 혼합 경로 검색", use_container_width=True):
                 )
                 for i, c in enumerate(all_sorted, start=1):
                     score = value_score(c, all_candidates)
+                    extra = ""
+                    if c["kind"] in ("mixed_first", "mixed_last"):
+                        taxi_time = safe_int(c.get("taxi_time_min"), 0)
+                        total_time = max(safe_int(c.get("time_min"), 1), 1)
+                        taxi_share = round(taxi_time / total_time * 100)
+                        extra = f" | 🚕 비중 {taxi_share}%"
+
                     st.write(
                         f"{i}. [{c['kind']}] {c['title']}"
                         f"{' / ' + c['subtitle'] if c.get('subtitle') else ''}"
                         f" | ⏳ {c['time_min']}분 | 💸 {fmt_won(c['cost'])}"
+                        f"{extra}"
                         f" | 🎯 점수: {score:.3f} | {c['status']}"
                     )
 
