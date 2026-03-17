@@ -13,6 +13,8 @@ MAX_TRANSIT_PATHS = 4
 MAX_CANDIDATE_POINTS = 12
 MAX_MIXED_CARDS = 15
 MAX_INTERMEDIATE_CANDIDATES = 12
+DIRECT_STOP_WALK_MIN = 3          # 첫/마지막 도보가 3분 이상이면 직접 정류장 택시 검토
+DIRECT_STOP_EXTRA_FARE_ALLOW = 3000  # 시간이 더 좋아지면 3천원까지 추가 허용
 # 너무 짧은 택시 구간 제거
 MIN_TAXI_MIN = 4
 MIN_TAXI_KM = 1.5
@@ -72,6 +74,100 @@ ODSAY_API_KEY = st.secrets["ODSAY_API_KEY"]
 # =========================================================
 # 공통 유틸
 # =========================================================
+
+def make_point(name, x, y, walk_min=0):
+    x = safe_float(x, None)
+    y = safe_float(y, None)
+    if not name or x is None or y is None:
+        return None
+    return {
+        "name": str(name),
+        "x": x,
+        "y": y,
+        "walk_min": safe_int(walk_min, 0),
+    }
+
+
+def get_first_boarding_stop(path):
+    """
+    경로 시작 부분에서 첫 대중교통 승차 정류장/역을 찾는다.
+    앞에 붙은 도보 시간도 같이 계산.
+    """
+    if not isinstance(path, dict):
+        return None
+
+    subpaths = path.get("subPath", [])
+    if not isinstance(subpaths, list):
+        return None
+
+    leading_walk = 0
+    for sp in subpaths:
+        if not isinstance(sp, dict):
+            continue
+
+        tt = sp.get("trafficType")
+        if tt == 3:
+            leading_walk += safe_int(sp.get("sectionTime", 0))
+            continue
+
+        if tt in (1, 2):
+            return make_point(
+                sp.get("startName"),
+                sp.get("startX"),
+                sp.get("startY"),
+                walk_min=leading_walk,
+            )
+
+    return None
+
+
+def get_last_alighting_stop(path):
+    """
+    경로 끝 부분에서 마지막 대중교통 하차 정류장/역을 찾는다.
+    뒤에 붙은 도보 시간도 같이 계산.
+    """
+    if not isinstance(path, dict):
+        return None
+
+    subpaths = path.get("subPath", [])
+    if not isinstance(subpaths, list):
+        return None
+
+    trailing_walk = 0
+    for sp in reversed(subpaths):
+        if not isinstance(sp, dict):
+            continue
+
+        tt = sp.get("trafficType")
+        if tt == 3:
+            trailing_walk += safe_int(sp.get("sectionTime", 0))
+            continue
+
+        if tt in (1, 2):
+            return make_point(
+                sp.get("endName"),
+                sp.get("endX"),
+                sp.get("endY"),
+                walk_min=trailing_walk,
+            )
+
+    return None
+
+
+def should_replace_with_direct_stop(old_time, old_cost, new_time, new_cost):
+    """
+    직접 정류장까지 택시로 가는 새 해가 더 낫다고 볼지 판단
+    """
+    # 완전 우월
+    if new_time <= old_time and new_cost <= old_cost:
+        return True
+
+    # 시간 2분 이상 개선 + 비용 증가가 3천원 이하
+    if new_time + 2 <= old_time and new_cost <= old_cost + DIRECT_STOP_EXTRA_FARE_ALLOW:
+        return True
+
+    return False
+    
 def kakao_headers():
     return {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
 
@@ -1153,13 +1249,59 @@ def build_route_candidates(origin, destination, arrive_by):
             if not valid_taxi_leg(car_head):
                 continue
 
-            transit_from_board = get_best_transit_path(board["x"], board["y"], destination["x"], destination["y"])
-            if transit_from_board is None:
-                continue
+           transit_from_board = get_best_transit_path(board["x"], board["y"], destination["x"], destination["y"])
+if transit_from_board is None:
+    continue
 
-            transit_summary = path_to_summary(transit_from_board, start_offset_min=car_head["duration_min"])
-            if transit_summary is None:
-                continue
+# -------------------------------------------------
+# 보정: 첫 승차 정류장까지 도보가 길면
+# 후보지점이 아니라 실제 첫 승차 정류장까지 택시로 보내보자
+# -------------------------------------------------
+first_stop = get_first_boarding_stop(transit_from_board)
+if (
+    first_stop is not None
+    and first_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
+    and not is_same_point(board["x"], board["y"], first_stop["x"], first_stop["y"])
+):
+    try:
+        car_head_direct = get_car_summary(
+            origin["x"], origin["y"], first_stop["x"], first_stop["y"]
+        )
+        if valid_taxi_leg(car_head_direct):
+            transit_from_direct = get_best_transit_path(
+                first_stop["x"], first_stop["y"], destination["x"], destination["y"]
+            )
+            if transit_from_direct is not None:
+                old_summary = path_to_summary(
+                    transit_from_board, start_offset_min=car_head["duration_min"]
+                )
+                new_summary = path_to_summary(
+                    transit_from_direct, start_offset_min=car_head_direct["duration_min"]
+                )
+
+                if old_summary is not None and new_summary is not None:
+                    old_total_time = car_head["duration_min"] + old_summary["time_min"]
+                    old_total_cost = car_head["taxi_fare"] + old_summary["cost"]
+
+                    new_total_time = car_head_direct["duration_min"] + new_summary["time_min"]
+                    new_total_cost = car_head_direct["taxi_fare"] + new_summary["cost"]
+
+                    if should_replace_with_direct_stop(
+                        old_total_time, old_total_cost, new_total_time, new_total_cost
+                    ):
+                        board = {
+                            "name": first_stop["name"],
+                            "x": first_stop["x"],
+                            "y": first_stop["y"],
+                        }
+                        car_head = car_head_direct
+                        transit_from_board = transit_from_direct
+    except Exception:
+        pass
+
+transit_summary = path_to_summary(transit_from_board, start_offset_min=car_head["duration_min"])
+if transit_summary is None:
+    continue
 
             total_mix_time = car_head["duration_min"] + transit_summary["time_min"]
             total_mix_cost = car_head["taxi_fare"] + transit_summary["cost"]
@@ -1200,16 +1342,58 @@ def build_route_candidates(origin, destination, arrive_by):
     for split in split_candidates:
         try:
             transit_to_split = get_best_transit_path(origin["x"], origin["y"], split["x"], split["y"])
-            if transit_to_split is None:
-                continue
+if transit_to_split is None:
+    continue
 
-            transit_summary = path_to_summary(transit_to_split, start_offset_min=0)
-            if transit_summary is None:
-                continue
+transit_summary = path_to_summary(transit_to_split, start_offset_min=0)
+if transit_summary is None:
+    continue
 
-            car_tail = get_car_summary(split["x"], split["y"], destination["x"], destination["y"])
-            if not valid_taxi_leg(car_tail):
-                continue
+car_tail = get_car_summary(split["x"], split["y"], destination["x"], destination["y"])
+if not valid_taxi_leg(car_tail):
+    continue
+
+# -------------------------------------------------
+# 보정: 마지막 하차 후 도보가 길면
+# 실제 마지막 하차 정류장에서 바로 택시 타는 안도 비교
+# -------------------------------------------------
+last_stop = get_last_alighting_stop(transit_to_split)
+if (
+    last_stop is not None
+    and last_stop["walk_min"] >= DIRECT_STOP_WALK_MIN
+    and not is_same_point(split["x"], split["y"], last_stop["x"], last_stop["y"])
+):
+    try:
+        transit_to_direct = get_best_transit_path(
+            origin["x"], origin["y"], last_stop["x"], last_stop["y"]
+        )
+        car_tail_direct = get_car_summary(
+            last_stop["x"], last_stop["y"], destination["x"], destination["y"]
+        )
+
+        if transit_to_direct is not None and valid_taxi_leg(car_tail_direct):
+            new_transit_summary = path_to_summary(transit_to_direct, start_offset_min=0)
+
+            if new_transit_summary is not None:
+                old_total_time = transit_summary["time_min"] + car_tail["duration_min"]
+                old_total_cost = transit_summary["cost"] + car_tail["taxi_fare"]
+
+                new_total_time = new_transit_summary["time_min"] + car_tail_direct["duration_min"]
+                new_total_cost = new_transit_summary["cost"] + car_tail_direct["taxi_fare"]
+
+                if should_replace_with_direct_stop(
+                    old_total_time, old_total_cost, new_total_time, new_total_cost
+                ):
+                    split = {
+                        "name": last_stop["name"],
+                        "x": last_stop["x"],
+                        "y": last_stop["y"],
+                    }
+                    transit_to_split = transit_to_direct
+                    transit_summary = new_transit_summary
+                    car_tail = car_tail_direct
+    except Exception:
+        pass
 
             total_mix_time = transit_summary["time_min"] + car_tail["duration_min"]
             total_mix_cost = transit_summary["cost"] + car_tail["taxi_fare"]
