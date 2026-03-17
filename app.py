@@ -1047,26 +1047,42 @@ def build_route_candidates(origin, destination, arrive_by):
 # 정렬 / 추천
 # =========================================================
 def value_score(c, candidates):
+    # 1. 정규화 (Min-Max Scaling)
     costs = [x["cost"] for x in candidates]
     times = [x["time_min"] for x in candidates]
 
     min_cost, max_cost = min(costs), max(costs)
     min_time, max_time = min(times), max(times)
 
-    if max_cost == min_cost:
-        cost_norm = 0
-    else:
-        cost_norm = (c["cost"] - min_cost) / (max_cost - min_cost)
+    cost_norm = 0 if max_cost == min_cost else (c["cost"] - min_cost) / (max_cost - min_cost)
+    time_norm = 0 if max_time == min_time else (c["time_min"] - min_time) / (max_time - min_time)
 
-    if max_time == min_time:
-        time_norm = 0
+    # 2. 여유 시간(Slack time)에 따른 동적 가중치 계산
+    slack_min = c.get("late_diff")
+    
+    if slack_min is None:
+        # 도착 희망 시간이 없으면 기존의 고정 설정값 사용
+        dynamic_cost_weight = VALUE_COST_WEIGHT
+        dynamic_time_weight = VALUE_TIME_WEIGHT
     else:
-        time_norm = (c["time_min"] - min_time) / (max_time - min_time)
+        # 선형 보간 (Linear Interpolation)
+        if slack_min >= 60:
+            dynamic_time_weight = 0.1  # 60분 이상 남음: 비용 0.9 / 시간 0.1
+        elif slack_min <= 10:
+            dynamic_time_weight = 0.9  # 10분 이하 남음: 비용 0.1 / 시간 0.9
+        else:
+            # 10분 ~ 60분 사이일 때 부드럽게 변환
+            dynamic_time_weight = 0.9 - 0.8 * ((slack_min - 10) / 50)
+            
+        dynamic_cost_weight = 1.0 - dynamic_time_weight
 
+    # 3. 페널티 (지각 및 수단 페널티)
     late_penalty = 1 if c["late"] else 0
     kind_penalty = VALUE_KIND_PENALTY.get(c["kind"], 0)
 
-    score = late_penalty + kind_penalty + (VALUE_COST_WEIGHT * cost_norm) + (VALUE_TIME_WEIGHT * time_norm)
+    # 4. 최종 스코어 계산 (값이 작을수록 최적해)
+    score = late_penalty + kind_penalty + (dynamic_cost_weight * cost_norm) + (dynamic_time_weight * time_norm)
+    
     return score
 
 
