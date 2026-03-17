@@ -30,7 +30,7 @@ PARALLEL_WORKERS = 6
 # 사전 필터 (Haversine)
 PREFILTER_MIN_KM = 1.0            # 출발지에서 1km 미만 후보 제외
 PREFILTER_MAX_RATIO = 0.80        # 총 거리의 80% 넘으면 제외
-PREFILTER_TOP_N = 8     20         # 사전 필터 후 상위 N개만 API 호출
+PREFILTER_TOP_N = 20         # 사전 필터 후 상위 N개만 API 호출
 
 # 버스 실시간 반영
 REALTIME_BUS_ENABLED = True
