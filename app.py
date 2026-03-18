@@ -584,6 +584,209 @@ def get_best_transit_path(origin_x, origin_y, dest_x, dest_y):
 
 
 # =========================================================
+# [실시간 버스] 공공데이터포털 서울시 버스도착정보 API
+# ODsay 실시간 API 대신 사용 → ODsay 호출 0건
+# =========================================================
+BUS_REALTIME_CACHE_TTL = 25
+BUS_REALTIME_WAIT_CAP = 15
+
+
+def _extract_ars_id(sp):
+    """ODsay subPath에서 정류소 arsId 추출."""
+    if not isinstance(sp, dict):
+        return None
+    for key in ["startArsID", "startarsId", "arsId", "startLocalStationID"]:
+        val = sp.get(key)
+        if val and str(val).strip() and str(val).strip() != "0":
+            return str(val).strip()
+    return None
+
+
+def _extract_bus_info(sp):
+    if not isinstance(sp, dict) or sp.get("trafficType") != 2:
+        return None
+    lane = sp.get("lane", [])
+    if not isinstance(lane, list) or not lane or not isinstance(lane[0], dict):
+        return None
+    return {
+        "bus_no": str(lane[0].get("busNo", "")) or None,
+        "bus_id": str(lane[0].get("busID", "")) or None,
+    }
+
+
+@st.cache_data(ttl=BUS_REALTIME_CACHE_TTL)
+def fetch_bus_arrival_public(ars_id):
+    """공공데이터포털 서울시 버스도착정보. 무료 일 1,000건+."""
+    if not PUBLIC_DATA_API_KEY or not ars_id:
+        return []
+    count_api("public")
+    try:
+        url = "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid"
+        params = {"ServiceKey": PUBLIC_DATA_API_KEY, "arsId": ars_id, "resultType": "json"}
+        r = _session.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("msgBody", {}).get("itemList", [])
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def _parse_bus_arrival_sec(item):
+    if not isinstance(item, dict):
+        return None
+    for key in ["traPredict", "predictTime1", "exps1"]:
+        val = safe_int(item.get(key), None)
+        if val and val > 0:
+            return val
+    msg = item.get("arrmsg1", "")
+    if isinstance(msg, str) and "분" in msg:
+        try:
+            return int(msg.split("분")[0].strip().split()[-1]) * 60
+        except Exception:
+            pass
+    return None
+
+
+def get_bus_wait_minutes(sp):
+    """실시간 버스 대기시간. arsId 없으면 graceful skip."""
+    if not USE_PUBLIC_BUS_API:
+        return None
+    ars_id = _extract_ars_id(sp)
+    if not ars_id:
+        return None
+    bus_info = _extract_bus_info(sp)
+    items = fetch_bus_arrival_public(ars_id)
+    if not items:
+        return None
+
+    bus_no = bus_info.get("bus_no") if bus_info else None
+    best_sec = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if bus_no and str(item.get("rtNm", "")).strip() != bus_no:
+            continue
+        arr_sec = _parse_bus_arrival_sec(item)
+        if arr_sec and (best_sec is None or arr_sec < best_sec):
+            best_sec = arr_sec
+
+    if best_sec is None:
+        return None
+    return min(max(1, math.ceil(best_sec / 60)), BUS_REALTIME_WAIT_CAP)
+
+
+def compute_bus_realtime_adjustment(path, start_offset_min=0):
+    """경로 내 버스 구간 실시간 대기시간 합산."""
+    if not USE_PUBLIC_BUS_API or not isinstance(path, dict) or start_offset_min > 0:
+        return {"extra_wait_min": 0, "notes": []}
+    subpaths = path.get("subPath", [])
+    if not isinstance(subpaths, list):
+        return {"extra_wait_min": 0, "notes": []}
+
+    extra = 0
+    notes = []
+    for sp in subpaths:
+        if not isinstance(sp, dict) or sp.get("trafficType") != 2:
+            continue
+        wait = get_bus_wait_minutes(sp)
+        if wait is None:
+            continue
+        bus_info = _extract_bus_info(sp)
+        label = (bus_info.get("bus_no") or "버스") if bus_info else "버스"
+        extra += wait
+        notes.append(f"{label}번 ({sp.get('startName', '')}) 실시간: {wait}분 후 도착")
+
+    return {"extra_wait_min": extra, "notes": notes}
+
+
+# =========================================================
+# [지하철 시간표] 로컬 추정 엔진 — API 호출 0건
+# 시간대별 배차간격 기반으로 대기시간 보정
+# =========================================================
+import re as _re
+
+SUBWAY_HEADWAY = {
+    "1호선": (3, 6, 10), "2호선": (2.5, 5, 8), "3호선": (3, 6, 10),
+    "4호선": (3, 6, 10), "5호선": (3, 6, 10), "6호선": (4, 7, 10),
+    "7호선": (3, 6, 10), "8호선": (4, 7, 12), "9호선": (3, 5, 8),
+    "경의중앙선": (8, 15, 20), "경춘선": (10, 20, 30),
+    "수인분당선": (5, 8, 12), "신분당선": (4, 6, 10),
+    "공항철도": (6, 12, 15), "GTX-A": (5, 10, 15),
+    "default": (4, 7, 12),
+}
+RUSH_HOURS = [(7, 9), (17, 19)]
+LATE_NIGHT_START = 22
+
+
+def _time_category(offset_min=0):
+    h = (now_kst() + timedelta(minutes=offset_min)).hour
+    for s, e in RUSH_HOURS:
+        if s <= h < e:
+            return "rush"
+    return "late" if (h >= LATE_NIGHT_START or h < 5) else "normal"
+
+
+def _get_headway(line_name, offset_min=0):
+    cat = _time_category(offset_min)
+    key = None
+    for k in SUBWAY_HEADWAY:
+        if k in line_name:
+            key = k
+            break
+    if not key:
+        m = _re.search(r'(\d+)호선', line_name)
+        if m:
+            key = f"{m.group(1)}호선"
+    hw = SUBWAY_HEADWAY.get(key, SUBWAY_HEADWAY["default"])
+    return hw[0] if cat == "rush" else hw[2] if cat == "late" else hw[1]
+
+
+def _extract_subway_line_name(sp):
+    lane = sp.get("lane", [])
+    if isinstance(lane, list) and lane and isinstance(lane[0], dict):
+        return first_non_none(lane[0], ["name", "laneName"], "지하철")
+    return "지하철"
+
+
+def compute_subway_schedule_adjustment(path, start_offset_min=0):
+    """배차간격 기반 대기시간 보정. API 0건."""
+    if not USE_LOCAL_SUBWAY_ESTIMATE or not isinstance(path, dict):
+        return {"delta_min": 0, "notes": []}
+    subpaths = path.get("subPath", [])
+    if not isinstance(subpaths, list):
+        return {"delta_min": 0, "notes": []}
+
+    delta_total = 0
+    notes = []
+    cum = start_offset_min
+
+    for sp in subpaths:
+        if not isinstance(sp, dict):
+            continue
+        sec = safe_int(sp.get("sectionTime", 0))
+        if sp.get("trafficType") != 1:
+            cum += sec
+            continue
+
+        line = _extract_subway_line_name(sp)
+        hw = _get_headway(line, cum)
+        avg_wait = hw / 2.0
+        base_wait = 2.5  # ODsay 기본 가정
+        delta = round(avg_wait - base_wait)
+
+        if delta != 0:
+            delta_total += delta
+            cat = {"rush": "출퇴근", "normal": "평시", "late": "심야"}.get(_time_category(cum), "")
+            sign = "+" if delta > 0 else ""
+            notes.append(f"{line} {sp.get('startName', '')} / {cat} 배차 {hw:.0f}분 / {sign}{delta}분 보정")
+
+        cum += sec
+
+    return {"delta_min": delta_total, "notes": notes}
+
+
+# =========================================================
 # 포맷팅
 # =========================================================
 def path_type_to_text(pt):
@@ -613,19 +816,32 @@ def format_subpath(sp):
     return f"이동: {sn} → {en} ({sec}분)"
 
 
-def path_to_summary(path):
+def path_to_summary(path, start_offset_min=0):
     if not isinstance(path, dict):
         return None
     info = path.get("info", {})
     subpaths = path.get("subPath", [])
+
+    # 실시간 버스 + 지하철 시간표 보정
+    bus_adj = compute_bus_realtime_adjustment(path, start_offset_min)
+    sub_adj = compute_subway_schedule_adjustment(path, start_offset_min)
+
+    base_time = safe_int(info.get("totalTime", 0))
+    bus_extra = safe_int(bus_adj.get("extra_wait_min", 0))
+    sub_delta = safe_int(sub_adj.get("delta_min", 0))
+
     return {
-        "time_min": safe_int(info.get("totalTime", 0)),
+        "time_min": base_time + bus_extra + sub_delta,
+        "base_time_min": base_time,
+        "bus_live_extra_min": bus_extra,
+        "subway_sched_delta_min": sub_delta,
         "cost": safe_int(info.get("payment", 0)),
         "walk_m": safe_int(info.get("totalWalk", 0)),
         "bus_transit_count": safe_int(info.get("busTransitCount", 0)),
         "subway_transit_count": safe_int(info.get("subwayTransitCount", 0)),
         "path_type": path_type_to_text(path.get("pathType")),
         "steps": [format_subpath(sp) for sp in subpaths if isinstance(sp, dict)],
+        "live_notes": bus_adj.get("notes", []) + sub_adj.get("notes", []),
     }
 
 
@@ -677,10 +893,63 @@ def collect_subpath_points(sp):
 
 
 def extract_candidates_filtered(paths, reference, exclude, total_dist_km):
-    """경로에서 후보 추출 + Haversine 사전 필터. API 호출 0건."""
+    """
+    경로에서 후보 추출 + Haversine 사전 필터.
+    [핵심] 환승역(버스↔지하철 전환 지점)은 무조건 최우선 포함.
+    """
     per_path = max(3, MAX_INTERMEDIATE_CANDIDATES // min(len(paths), MAX_TRANSIT_PATHS))
+
+    # 1단계: 환승역 추출 (최우선)
+    transfer_points = []
+    transfer_seen = set()
+
+    for path in paths[:MAX_TRANSIT_PATHS]:
+        if not isinstance(path, dict):
+            continue
+        subpaths = path.get("subPath", [])
+        if not isinstance(subpaths, list):
+            continue
+
+        for i in range(len(subpaths) - 1):
+            sp_cur = subpaths[i] if isinstance(subpaths[i], dict) else {}
+            # 다음 대중교통 subPath 찾기 (도보 건너뛰기)
+            sp_next = None
+            for j in range(i + 1, len(subpaths)):
+                if isinstance(subpaths[j], dict) and subpaths[j].get("trafficType") in (1, 2):
+                    sp_next = subpaths[j]
+                    break
+
+            if sp_next is None:
+                continue
+
+            tt_cur = sp_cur.get("trafficType")
+            tt_next = sp_next.get("trafficType")
+
+            # 버스→지하철 or 지하철→버스 환승 지점
+            if tt_cur in (1, 2) and tt_next in (1, 2) and tt_cur != tt_next:
+                # 현재 구간의 end = 다음 구간의 start 근처
+                p = normalize_candidate_point(
+                    sp_cur.get("endName"), sp_cur.get("endX"), sp_cur.get("endY"))
+                if p:
+                    key = (round(p["x"], 6), round(p["y"], 6))
+                    if key not in transfer_seen and not is_same_point(p["x"], p["y"], exclude["x"], exclude["y"]):
+                        transfer_seen.add(key)
+                        p["is_transfer"] = True
+                        transfer_points.append(p)
+
+                # 다음 구간의 start도
+                p2 = normalize_candidate_point(
+                    sp_next.get("startName"), sp_next.get("startX"), sp_next.get("startY"))
+                if p2:
+                    key2 = (round(p2["x"], 6), round(p2["y"], 6))
+                    if key2 not in transfer_seen and not is_same_point(p2["x"], p2["y"], exclude["x"], exclude["y"]):
+                        transfer_seen.add(key2)
+                        p2["is_transfer"] = True
+                        transfer_points.append(p2)
+
+    # 2단계: 일반 후보 추출
     all_cands = []
-    seen = set()
+    seen = set(transfer_seen)  # 환승역은 이미 추가했으므로 중복 방지
 
     for path in paths[:MAX_TRANSIT_PATHS]:
         if not isinstance(path, dict):
@@ -705,7 +974,9 @@ def extract_candidates_filtered(paths, reference, exclude, total_dist_km):
         for _, p in path_pts[:per_path]:
             all_cands.append(p)
 
-    return all_cands[:PREFILTER_TOP_N]
+    # 환승역 먼저 + 나머지 (환승역은 거리 필터 무시)
+    result = transfer_points + all_cands
+    return result[:PREFILTER_TOP_N + len(transfer_points)]  # 환승역은 제한에 안 걸리게
 
 
 # =========================================================
@@ -846,6 +1117,14 @@ def build_route_candidates(origin, destination, arrive_by):
         if not summary:
             continue
         status = calc_arrival_status(summary["time_min"], arrive_by)
+
+        reason = "가장 저렴한 선택지"
+        if summary.get("bus_live_extra_min", 0) > 0:
+            reason += f" / 버스 실시간 대기 {summary['bus_live_extra_min']}분 반영"
+        if summary.get("subway_sched_delta_min", 0) != 0:
+            sign = "+" if summary["subway_sched_delta_min"] > 0 else ""
+            reason += f" / 지하철 {sign}{summary['subway_sched_delta_min']}분 보정"
+
         candidates.append({
             "kind": "transit", "title": "대중교통만",
             "subtitle": f"{idx}번 경로 · {summary['path_type']}",
@@ -856,11 +1135,11 @@ def build_route_candidates(origin, destination, arrive_by):
             "status": status["text"],
             "late": status["late"],
             "late_diff": status["diff_min"],
-            "reason": "가장 저렴한 선택지",
+            "reason": reason,
             "steps": summary["steps"],
             "bus_transit_count": summary["bus_transit_count"],
             "subway_transit_count": summary["subway_transit_count"],
-            "live_notes": [],
+            "live_notes": summary.get("live_notes", []),
         })
 
     total_dist = haversine_km(origin["x"], origin["y"],
