@@ -25,9 +25,9 @@ ARRIVE_BUFFER_MIN = 15
 PARALLEL_WORKERS = 6
 
 # 사전 필터 (Haversine)
-PREFILTER_MIN_KM = 0.8
-PREFILTER_MAX_RATIO = 0.75
-PREFILTER_TOP_N = 6           # API 호출할 최대 후보 수 (줄임!)
+PREFILTER_MIN_KM = 0.5
+PREFILTER_MAX_RATIO = 0.80
+PREFILTER_TOP_N = 8           # API 호출할 최대 후보 수
 
 # 택시 요금 공식 (서울 기준 2024~)
 TAXI_BASE_FARE = 4800         # 기본요금
@@ -360,52 +360,137 @@ def get_transit_paths(origin_x, origin_y, dest_x, dest_y):
     return paths
 
 
+def _point_near(x1, y1, x2, y2, threshold_km=0.4):
+    """300m 이내면 같은 지점으로 간주 (좌표 오차 허용)."""
+    return haversine_km(x1, y1, x2, y2) < threshold_km
+
+
+def _find_split_index_in_path(path, split_x, split_y):
+    """
+    경로 내에서 split 지점과 가장 가까운 위치를 찾는다.
+    subPath의 start/end뿐 아니라 passStopList 중간 정류장도 검색.
+    반환: (subpath_index, position_ratio) 또는 None
+      - subpath_index: split이 속한 subPath의 인덱스
+      - position_ratio: 해당 subPath 내에서의 위치 비율 (0.0~1.0)
+    """
+    subpaths = path.get("subPath", [])
+    if not isinstance(subpaths, list):
+        return None
+
+    best_dist = 999
+    best_sp_idx = None
+    best_ratio = 0.0
+
+    for sp_idx, sp in enumerate(subpaths):
+        if not isinstance(sp, dict):
+            continue
+        tt = sp.get("trafficType")
+        if tt not in (1, 2):  # 대중교통만
+            # 도보 구간도 start/end 체크
+            sx = safe_float(sp.get("startX"), 0)
+            sy = safe_float(sp.get("startY"), 0)
+            if sx and sy:
+                d = haversine_km(split_x, split_y, sx, sy)
+                if d < best_dist:
+                    best_dist = d
+                    best_sp_idx = sp_idx
+                    best_ratio = 0.0
+            continue
+
+        # start 체크
+        sx = safe_float(sp.get("startX"), 0)
+        sy = safe_float(sp.get("startY"), 0)
+        if sx and sy:
+            d = haversine_km(split_x, split_y, sx, sy)
+            if d < best_dist:
+                best_dist = d
+                best_sp_idx = sp_idx
+                best_ratio = 0.0
+
+        # end 체크
+        ex = safe_float(sp.get("endX"), 0)
+        ey = safe_float(sp.get("endY"), 0)
+        if ex and ey:
+            d = haversine_km(split_x, split_y, ex, ey)
+            if d < best_dist:
+                best_dist = d
+                best_sp_idx = sp_idx
+                best_ratio = 1.0
+
+        # passStopList 중간 정류장 체크
+        psl = sp.get("passStopList")
+        if isinstance(psl, dict):
+            items = None
+            for key in ["stations", "station", "list", "items"]:
+                v = psl.get(key)
+                if isinstance(v, list):
+                    items = v
+                    break
+            if items:
+                n_stops = len(items)
+                for stop_idx, item in enumerate(items):
+                    if not isinstance(item, dict):
+                        continue
+                    px = safe_float(first_non_none(item, ["x", "X", "gpsX", "lon", "lng"], None), 0)
+                    py = safe_float(first_non_none(item, ["y", "Y", "gpsY", "lat"], None), 0)
+                    if not px or not py:
+                        continue
+                    d = haversine_km(split_x, split_y, px, py)
+                    if d < best_dist:
+                        best_dist = d
+                        best_sp_idx = sp_idx
+                        best_ratio = (stop_idx + 1) / max(n_stops, 1)
+
+    # 400m 이내에서 찾지 못하면 실패
+    if best_dist > 0.4 or best_sp_idx is None:
+        return None
+
+    return (best_sp_idx, best_ratio)
+
+
 def slice_transit_path_from(path, split_x, split_y):
     """
-    경로의 중간 지점(split)부터 끝까지의 시간/비용을 추정.
-    API 호출 없이 subPath 데이터를 잘라서 계산.
+    split 지점부터 끝까지의 시간/비용을 추정.
+    passStopList 내부 중간 정류장도 매칭. API 호출 0건.
     """
     if not isinstance(path, dict):
         return None
 
+    result = _find_split_index_in_path(path, split_x, split_y)
+    if result is None:
+        return None
+
+    sp_idx, ratio = result
     subpaths = path.get("subPath", [])
     info = path.get("info", {})
 
-    found = False
     remaining_time = 0
     remaining_steps = []
 
-    for sp in subpaths:
+    for i, sp in enumerate(subpaths):
         if not isinstance(sp, dict):
             continue
+        sec = safe_int(sp.get("sectionTime", 0))
 
-        if not found:
-            # split 지점 찾기 — start 또는 end가 매칭되면 거기부터 시작
-            sx = safe_float(sp.get("startX"), 0)
-            sy = safe_float(sp.get("startY"), 0)
-            ex = safe_float(sp.get("endX"), 0)
-            ey = safe_float(sp.get("endY"), 0)
-
-            if is_same_point(sx, sy, split_x, split_y) or is_same_point(ex, ey, split_x, split_y):
-                found = True
-                remaining_time += safe_int(sp.get("sectionTime", 0))
+        if i < sp_idx:
+            continue  # split 이전 → 스킵
+        elif i == sp_idx:
+            # split이 있는 subPath → 남은 비율만큼
+            partial = int(sec * (1.0 - ratio))
+            if partial > 0:
+                remaining_time += partial
                 remaining_steps.append(sp)
-            continue
+        else:
+            remaining_time += sec
+            remaining_steps.append(sp)
 
-        remaining_time += safe_int(sp.get("sectionTime", 0))
-        remaining_steps.append(sp)
-
-    if not found or remaining_time == 0:
+    if remaining_time <= 0:
         return None
 
-    # 비용은 비례 배분 추정
     total_time = safe_int(info.get("totalTime", 1))
     total_cost = safe_int(info.get("payment", 0))
-    ratio = remaining_time / max(total_time, 1)
-    estimated_cost = int(total_cost * ratio)
-
-    # 대중교통 기본요금 이하로 내려가지 않도록
-    estimated_cost = max(estimated_cost, 1250)
+    cost_ratio = remaining_time / max(total_time, 1)
+    estimated_cost = max(int(total_cost * cost_ratio), 1250)
 
     return {
         "time_min": remaining_time,
@@ -417,40 +502,48 @@ def slice_transit_path_from(path, split_x, split_y):
 
 def slice_transit_path_until(path, split_x, split_y):
     """
-    경로의 처음부터 split 지점까지의 시간/비용을 추정.
-    API 호출 없이 subPath 데이터를 잘라서 계산.
+    처음부터 split 지점까지의 시간/비용을 추정.
+    passStopList 내부 중간 정류장도 매칭. API 호출 0건.
     """
     if not isinstance(path, dict):
         return None
 
+    result = _find_split_index_in_path(path, split_x, split_y)
+    if result is None:
+        return None
+
+    sp_idx, ratio = result
     subpaths = path.get("subPath", [])
     info = path.get("info", {})
 
     elapsed_time = 0
     collected_steps = []
 
-    for sp in subpaths:
+    for i, sp in enumerate(subpaths):
         if not isinstance(sp, dict):
             continue
+        sec = safe_int(sp.get("sectionTime", 0))
 
-        elapsed_time += safe_int(sp.get("sectionTime", 0))
-        collected_steps.append(sp)
-
-        sx = safe_float(sp.get("startX"), 0)
-        sy = safe_float(sp.get("startY"), 0)
-        ex = safe_float(sp.get("endX"), 0)
-        ey = safe_float(sp.get("endY"), 0)
-
-        if is_same_point(sx, sy, split_x, split_y) or is_same_point(ex, ey, split_x, split_y):
+        if i < sp_idx:
+            elapsed_time += sec
+            collected_steps.append(sp)
+        elif i == sp_idx:
+            # split이 있는 subPath → 비율만큼만
+            partial = int(sec * ratio)
+            if partial > 0:
+                elapsed_time += partial
+                collected_steps.append(sp)
+            break
+        else:
             break
 
-    if elapsed_time == 0:
+    if elapsed_time <= 0:
         return None
 
     total_time = safe_int(info.get("totalTime", 1))
     total_cost = safe_int(info.get("payment", 0))
-    ratio = elapsed_time / max(total_time, 1)
-    estimated_cost = max(int(total_cost * ratio), 1250)
+    cost_ratio = elapsed_time / max(total_time, 1)
+    estimated_cost = max(int(total_cost * cost_ratio), 1250)
 
     return {
         "time_min": elapsed_time,
@@ -458,6 +551,36 @@ def slice_transit_path_until(path, split_x, split_y):
         "steps": collected_steps,
         "walk_m": 0,
     }
+
+
+# =========================================================
+# Fallback: slice 실패한 상위 후보만 ODsay API 호출
+# =========================================================
+FALLBACK_API_LIMIT = 4  # slice 실패 시 최대 4건만 ODsay 호출
+
+
+@st.cache_data(ttl=300)
+def get_best_transit_path(origin_x, origin_y, dest_x, dest_y):
+    """slice 실패한 후보용 fallback. 호출 최소화."""
+    count_api("odsay")
+    try:
+        paths = get_transit_paths(origin_x, origin_y, dest_x, dest_y)
+    except Exception:
+        return None
+    best = None
+    best_key = None
+    for p in paths:
+        if not isinstance(p, dict):
+            continue
+        info = p.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        key = (safe_int(info.get("totalTime", 999999)),
+               safe_int(info.get("payment", 999999)))
+        if best is None or key < best_key:
+            best = p
+            best_key = key
+    return best
 
 
 # =========================================================
@@ -672,14 +795,13 @@ def valid_taxi_leg(car):
 # =========================================================
 def build_route_candidates(origin, destination, arrive_by):
     """
-    API 호출 내역:
-      - get_transit_paths: 1건 (ODsay)
-      - estimate_taxi (전체): 0건 (공식 계산)
-      - board 후보: estimate_taxi × N건 = 0건 (공식)
-      - split 후보: estimate_taxi × N건 = 0건 (공식)
-      - 경로 재활용 (slice): 0건
-      - 최종 확인 (카카오 정밀): 1~3건
-    총: ODsay 1건 + 카카오 3~5건 = 약 4~6건!
+    API 호출 내역 (하이브리드 전략):
+      - get_transit_paths: 1건 (ODsay) — 기본 경로
+      - estimate_taxi: 0건 (공식 계산) — 후보 비교용
+      - 경로 재활용 (slice): 0건 — passStopList까지 검색
+      - slice 실패 fallback: 최대 8건 (ODsay) — board 4 + split 4
+      - 최종 정밀 확인: 1~3건 (카카오) — TOP 결과만
+    총: ODsay 1~9건 + 카카오 3~5건 = 약 4~14건 (기존 61건 대비 75~93% 감소)
     """
 
     # 대중교통 실패 → 택시만
@@ -746,6 +868,7 @@ def build_route_candidates(origin, destination, arrive_by):
 
     # 3) 택시 → 대중교통 (board 후보)
     board_cands = extract_candidates_filtered(base_paths, origin, origin, total_dist)
+    board_fallback_count = 0
 
     for board in board_cands:
         # 택시 구간 — 공식 (0건)
@@ -753,12 +876,28 @@ def build_route_candidates(origin, destination, arrive_by):
         if not valid_taxi_leg(car_head):
             continue
 
-        # 대중교통 구간 — 경로 재활용 (0건)
+        # 대중교통 구간 — 경로 재활용 시도 (0건)
         best_slice = None
         for path in base_paths[:MAX_TRANSIT_PATHS]:
             s = slice_transit_path_from(path, board["x"], board["y"])
             if s and (best_slice is None or s["time_min"] < best_slice["time_min"]):
                 best_slice = s
+
+        # slice 실패 → fallback API (제한적으로만)
+        if best_slice is None and board_fallback_count < FALLBACK_API_LIMIT:
+            fb_path = get_best_transit_path(
+                round_coord(board["x"]), round_coord(board["y"]),
+                round_coord(destination["x"]), round_coord(destination["y"]))
+            if fb_path:
+                fb_summary = path_to_summary(fb_path)
+                if fb_summary:
+                    best_slice = {
+                        "time_min": fb_summary["time_min"],
+                        "cost": fb_summary["cost"],
+                        "steps": fb_path.get("subPath", []),
+                        "walk_m": fb_summary["walk_m"],
+                    }
+            board_fallback_count += 1
 
         if not best_slice or best_slice["time_min"] <= 0:
             continue
@@ -793,14 +932,31 @@ def build_route_candidates(origin, destination, arrive_by):
 
     # 4) 대중교통 → 택시 (split 후보)
     split_cands = extract_candidates_filtered(base_paths, destination, destination, total_dist)
+    split_fallback_count = 0
 
     for split in split_cands:
-        # 대중교통 구간 — 경로 재활용 (0건)
+        # 대중교통 구간 — 경로 재활용 시도 (0건)
         best_slice = None
         for path in base_paths[:MAX_TRANSIT_PATHS]:
             s = slice_transit_path_until(path, split["x"], split["y"])
             if s and (best_slice is None or s["time_min"] < best_slice["time_min"]):
                 best_slice = s
+
+        # slice 실패 → fallback API (제한적으로만)
+        if best_slice is None and split_fallback_count < FALLBACK_API_LIMIT:
+            fb_path = get_best_transit_path(
+                round_coord(origin["x"]), round_coord(origin["y"]),
+                round_coord(split["x"]), round_coord(split["y"]))
+            if fb_path:
+                fb_summary = path_to_summary(fb_path)
+                if fb_summary:
+                    best_slice = {
+                        "time_min": fb_summary["time_min"],
+                        "cost": fb_summary["cost"],
+                        "steps": fb_path.get("subPath", []),
+                        "walk_m": fb_summary["walk_m"],
+                    }
+            split_fallback_count += 1
 
         if not best_slice or best_slice["time_min"] <= 0:
             continue
