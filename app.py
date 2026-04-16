@@ -31,23 +31,26 @@ html, body, [class*="css"]  {
 }
 
 .block-container {
-    padding-top: 2.2rem;
-    padding-bottom: 3rem;
-    max-width: 1180px;
+    padding-top: 4rem;
+    padding-bottom: 2rem;
+    max-width: 1200px;
 }
 
 .main-title {
-    font-size: 3.25rem;
+    font-size: 3.4rem;
     font-weight: 800;
-    line-height: 1.05;
-    letter-spacing: -0.03em;
-    margin-bottom: 0.35rem;
+    line-height: 1.2;
+    margin: 0 0 0.5rem 0;
+    letter-spacing: -0.02em;
+    padding-top: 0.2rem;
+    overflow: visible;
 }
 
 .sub-title {
-    color: #9fb1c9;
-    font-size: 1.08rem;
-    margin-bottom: 1.4rem;
+    color: #94a3b8;
+    font-size: 1.05rem;
+    margin-bottom: 2rem;
+    line-height: 1.5;
 }
 
 .section-label {
