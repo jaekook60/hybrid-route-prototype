@@ -1514,10 +1514,7 @@ def pick_best_by_kind(candidates, kind, priority, arrive_by=None):
 # =========================================================
 # UI
 # =========================================================
-st.markdown('<div class="main-title">혼합 경로 추천기</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">대중교통 + 택시 조합으로 도착 시간과 비용을 함께 최적화</div>', unsafe_allow_html=True)
 
-st.markdown('<div class="custom-card">', unsafe_allow_html=True)
 
 col1, col2 = st.columns(2)
 with col1:
