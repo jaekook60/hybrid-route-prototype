@@ -8,10 +8,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
 
-st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layout="wide")
-
-import streamlit as st
-
 st.set_page_config(
     page_title="혼합 경로 추천기",
     page_icon="🛣️",
@@ -20,91 +16,170 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* 전체 배경 */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"]  {
+    font-family: 'Inter', sans-serif;
+}
+
 .stApp {
-    background: linear-gradient(180deg, #07111f 0%, #0b1220 100%);
+    background:
+        radial-gradient(circle at top left, rgba(37, 99, 235, 0.16), transparent 30%),
+        radial-gradient(circle at top right, rgba(6, 182, 212, 0.12), transparent 24%),
+        linear-gradient(180deg, #07111f 0%, #0b1220 100%);
     color: #f8fafc;
 }
 
-/* 기본 여백 */
 .block-container {
-    padding-top: 2rem;
-    padding-bottom: 2rem;
-    max-width: 1200px;
+    padding-top: 2.2rem;
+    padding-bottom: 3rem;
+    max-width: 1180px;
 }
 
-/* 타이틀 */
 .main-title {
-    font-size: 3rem;
+    font-size: 3.25rem;
     font-weight: 800;
-    margin-bottom: 0.3rem;
-    letter-spacing: -0.02em;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin-bottom: 0.35rem;
 }
 
 .sub-title {
-    color: #94a3b8;
-    font-size: 1rem;
-    margin-bottom: 1.5rem;
+    color: #9fb1c9;
+    font-size: 1.08rem;
+    margin-bottom: 1.4rem;
 }
 
-/* 입력창 / 셀렉트 박스 */
+.section-label {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 0.7rem;
+}
+
+.pill-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 0.9rem;
+}
+
+.pill {
+    display: inline-block;
+    padding: 0.36rem 0.8rem;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.16);
+    color: #bfdbfe;
+    border: 1px solid rgba(96, 165, 250, 0.18);
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.pill-success {
+    background: rgba(16, 185, 129, 0.15);
+    color: #a7f3d0;
+    border: 1px solid rgba(16, 185, 129, 0.18);
+}
+
+.small-muted {
+    color: #94a3b8;
+    font-size: 0.92rem;
+}
+
+.card-title {
+    font-size: 1.55rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin-bottom: 0.25rem;
+}
+
+.card-subtitle {
+    color: #96a8bf;
+    margin-bottom: 0.8rem;
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: rgba(10, 18, 33, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.12) !important;
+    border-radius: 24px !important;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+    padding: 0.35rem 0.35rem 0.5rem 0.35rem;
+    backdrop-filter: blur(10px);
+}
+
+div[data-testid="stMetric"] {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.86), rgba(8, 15, 28, 0.86));
+    border: 1px solid rgba(148, 163, 184, 0.10);
+    border-radius: 18px;
+    padding: 0.9rem 1rem;
+}
+
+div[data-testid="stMetricLabel"] {
+    color: #9db0c7 !important;
+    font-weight: 600;
+}
+
+div[data-testid="stMetricValue"] {
+    font-size: 2rem !important;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+}
+
+[data-testid="stTextInput"] label,
+[data-testid="stSelectbox"] label {
+    font-weight: 700;
+    color: #e5eefc !important;
+}
+
 [data-testid="stTextInput"] input,
-[data-testid="stSelectbox"] > div,
-[data-testid="stTimeInput"] input {
-    background-color: rgba(15, 23, 42, 0.95) !important;
-    border: 1px solid rgba(148, 163, 184, 0.15) !important;
-    border-radius: 14px !important;
+[data-testid="stSelectbox"] > div {
+    background-color: rgba(15, 23, 42, 0.94) !important;
+    border: 1px solid rgba(148, 163, 184, 0.16) !important;
+    border-radius: 16px !important;
     color: white !important;
 }
 
-/* 버튼 */
+[data-testid="stTextInput"] input {
+    min-height: 54px;
+}
+
 .stButton > button {
     width: 100%;
-    height: 54px;
+    min-height: 56px;
     border: none;
-    border-radius: 16px;
+    border-radius: 18px;
     color: white;
-    font-size: 1rem;
-    font-weight: 700;
-    background: linear-gradient(90deg, #2563eb 0%, #06b6d4 100%);
-    box-shadow: 0 8px 20px rgba(37, 99, 235, 0.28);
+    font-size: 1.04rem;
+    font-weight: 800;
+    background: linear-gradient(90deg, #2563eb 0%, #22c1ee 100%);
+    box-shadow: 0 12px 28px rgba(37, 99, 235, 0.24);
     transition: all 0.2s ease;
 }
 
 .stButton > button:hover {
     transform: translateY(-1px);
-    box-shadow: 0 12px 24px rgba(37, 99, 235, 0.35);
+    box-shadow: 0 16px 30px rgba(37, 99, 235, 0.30);
 }
 
-/* metric 카드 */
-div[data-testid="stMetric"] {
-    background: rgba(15, 23, 42, 0.78);
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    padding: 18px;
-    border-radius: 18px;
-}
-
-/* alert 박스 */
 div[data-testid="stAlert"] {
-    border-radius: 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.08);
 }
 
-/* expander */
 details {
-    background: rgba(15, 23, 42, 0.55);
+    background: rgba(15, 23, 42, 0.58);
     border: 1px solid rgba(148, 163, 184, 0.10);
-    border-radius: 16px;
-    padding: 6px 10px;
+    border-radius: 18px;
+    padding: 0.35rem 0.6rem;
 }
 
-/* 구분선 */
 hr {
     border: none;
-    border-top: 1px solid rgba(148, 163, 184, 0.15);
-    margin: 1.2rem 0;
+    border-top: 1px solid rgba(148, 163, 184, 0.14);
+    margin: 1rem 0 1.2rem 0;
 }
 </style>
 """, unsafe_allow_html=True)
+
 # =========================================================
 # 설정
 # =========================================================
@@ -1511,40 +1586,99 @@ def pick_best_by_kind(candidates, kind, priority, arrive_by=None):
     return pick_best(subset, priority, arrive_by) if subset else None
 
 
+
+
 # =========================================================
 # UI
 # =========================================================
+def route_kind_text(kind):
+    return {
+        "transit": "대중교통",
+        "mixed_first": "택시 → 대중교통",
+        "mixed_last": "대중교통 → 택시",
+        "taxi": "택시",
+    }.get(kind, kind)
 
 
-col1, col2 = st.columns(2)
-with col1:
-    start = st.text_input("출발지", "명지대 자연")
-with col2:
-    end = st.text_input("목적지", "강남역")
+def render_route_card(route, label=None, highlight=False):
+    if not route:
+        return
 
-col3, col4 = st.columns(2)
-with col3:
-    arrive_time = st.text_input("도착 희망 시간", "12:30")
-with col4:
-    priority = st.selectbox("우선순위", ["가성비", "최단시간", "최소환승"])
+    with st.container(border=True):
+        pills = []
+        if label:
+            pills.append(f'<span class="pill">{label}</span>')
+        pills.append(f'<span class="pill pill-success">{route_kind_text(route["kind"])}</span>')
+        st.markdown(f'<div class="pill-row">{"".join(pills)}</div>', unsafe_allow_html=True)
 
-search = st.button("혼합 경로 검색")
+        st.markdown(f'<div class="card-title">{route["title"]}</div>', unsafe_allow_html=True)
+        if route.get("subtitle"):
+            st.markdown(f'<div class="card-subtitle">{route["subtitle"]}</div>', unsafe_allow_html=True)
 
-st.markdown('</div>', unsafe_allow_html=True)
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("총 시간", f'{route["time_min"]}분')
+        with m2:
+            st.metric("총 비용", fmt_won(route["cost"]))
+        with m3:
+            if route.get("distance_km"):
+                st.metric("차량 거리", f'{route["distance_km"]}km')
+            else:
+                st.metric("도보 거리", f'{route.get("walk_m", "-")}m')
 
-col_a, col_b = st.columns(2)
-with col_a:
-    origin_text = st.text_input("출발지", placeholder="예: 서울역")
-with col_b:
-    destination_text = st.text_input("목적지", placeholder="예: 강남역")
+        if route.get("estimated"):
+            st.caption("💡 일부 택시 구간은 추정 요금입니다. 최종 상위 후보만 정밀 조회합니다.")
 
-col_c, col_d = st.columns(2)
-with col_c:
-    arrive_by = st.text_input("도착 희망 시간", placeholder="예: 19:00")
-with col_d:
-    priority = st.selectbox("우선순위", ["가성비", "최저비용", "제시간 도착"])
+        if route["late"]:
+            st.error(route["status"])
+        else:
+            st.success(route["status"])
 
-if st.button("혼합 경로 검색", use_container_width=True):
+        st.markdown(f"**추천 이유**  \\n{route['reason']}")
+
+        if route["kind"] in ("mixed_first", "mixed_last"):
+            taxi_time = safe_int(route.get("taxi_time_min"), 0)
+            total_time = max(safe_int(route.get("time_min"), 1), 1)
+            st.info(
+                f"택시 비중 {round(taxi_time / total_time * 100)}% · "
+                f"택시 {safe_int(route.get('taxi_cost', 0)):,}원 · "
+                f"대중교통 {safe_int(route.get('transit_cost', 0)):,}원"
+            )
+
+        if route.get("live_notes"):
+            with st.expander("실시간 / 시간표 보정 정보"):
+                for note in route["live_notes"]:
+                    st.write(f"• {note}")
+
+        st.markdown("#### 세부 흐름")
+        for line in route.get("steps", [])[:12]:
+            st.write(f"• {line}")
+
+
+st.markdown('<div class="main-title">혼합 경로 추천기</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-title">대중교통 + 택시 조합으로 도착 시간과 비용을 함께 최적화</div>',
+    unsafe_allow_html=True,
+)
+
+with st.container(border=True):
+    st.markdown('<div class="section-label">검색 조건</div>', unsafe_allow_html=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        origin_text = st.text_input("출발지", value="명지대 자연", placeholder="예: 서울역")
+    with col_b:
+        destination_text = st.text_input("목적지", value="강남역", placeholder="예: 강남역")
+
+    col_c, col_d = st.columns(2)
+    with col_c:
+        arrive_by = st.text_input("도착 희망 시간", value="12:30", placeholder="예: 19:00")
+    with col_d:
+        priority = st.selectbox("우선순위", ["가성비", "최저비용", "제시간 도착"], index=0)
+
+    search_clicked = st.button("혼합 경로 검색", use_container_width=True)
+
+if search_clicked:
     if not origin_text or not destination_text:
         st.warning("출발지와 목적지를 입력해줘.")
     else:
@@ -1565,12 +1699,12 @@ if st.button("혼합 경로 검색", use_container_width=True):
                 st.error("경로를 만들지 못했어.")
                 st.stop()
 
-            # API 호출 통계
             ac = st.session_state.api_calls
             total_calls = ac["odsay"] + ac["kakao"] + ac["public"]
+
             st.info(
                 f"API 호출: ODsay {ac['odsay']}건 · 카카오 {ac['kakao']}건 · "
-                f"공공 {ac['public']}건 · **총 {total_calls}건** "
+                f"공공 {ac['public']}건 · 총 {total_calls}건 "
                 f"(공식 계산으로 {ac['saved']}건 절약)"
             )
 
@@ -1583,79 +1717,31 @@ if st.button("혼합 경로 검색", use_container_width=True):
             st.success(f"{origin['name']} → {destination['name']} 추천 결과")
 
             if best_overall:
-                st.subheader("추천 1위")
-                with st.container(border=True):
-                    st.markdown(f"### {best_overall['title']}")
-                    if best_overall.get("subtitle"):
-                        st.caption(best_overall["subtitle"])
+                st.markdown("## 추천 1위")
+                render_route_card(best_overall, label="BEST", highlight=True)
 
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("총 시간", f"{best_overall['time_min']}분")
-                    c2.metric("총 비용", fmt_won(best_overall["cost"]))
-                    if best_overall.get("distance_km"):
-                        c3.metric("차량 거리", f"{best_overall['distance_km']}km")
-                    else:
-                        c3.metric("구분", best_overall["kind"])
+            st.markdown("## 비교 카드")
+            row1_col1, row1_col2 = st.columns(2)
+            with row1_col1:
+                if best_transit:
+                    render_route_card(best_transit, label="대중교통만")
+            with row1_col2:
+                if best_mf:
+                    render_route_card(best_mf, label="택시 → 대중교통")
 
-                    if best_overall.get("estimated"):
-                        st.caption("💡 택시 요금은 추정값입니다 (±15%)")
-
-                    if best_overall["late"]:
-                        st.error(best_overall["status"])
-                    else:
-                        st.success(best_overall["status"])
-
-                    st.write(f"추천 이유: {best_overall['reason']}")
-
-                    if best_overall["kind"] in ("mixed_first", "mixed_last"):
-                        tt = safe_int(best_overall.get("taxi_time_min"), 0)
-                        total = max(safe_int(best_overall.get("time_min"), 1), 1)
-                        st.write(f"택시 비중: {round(tt / total * 100)}%")
-
-                    st.write("세부 흐름")
-                    for line in best_overall.get("steps", [])[:12]:
-                        st.write(f"- {line}")
-
-            st.subheader("비교 카드")
-            for label, route in [("대중교통만", best_transit), ("택시→대중교통", best_mf),
-                                 ("대중교통→택시", best_ml), ("택시만", best_taxi)]:
-                if not route:
-                    continue
-                with st.container(border=True):
-                    st.markdown(f"### {label}")
-                    if route.get("subtitle"):
-                        st.caption(route["subtitle"])
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("총 시간", f"{route['time_min']}분")
-                    c2.metric("총 비용", fmt_won(route["cost"]))
-                    if route.get("distance_km"):
-                        c3.metric("차량 거리", f"{route['distance_km']}km")
-                    else:
-                        c3.metric("도보", f"{route.get('walk_m', '-')}m")
-
-                    if route.get("estimated"):
-                        st.caption("💡 택시 요금 추정값 (±15%)")
-
-                    if route["late"]:
-                        st.error(route["status"])
-                    else:
-                        st.success(route["status"])
-
-                    st.write(f"설명: {route['reason']}")
-
-                    if route["kind"] in ("mixed_first", "mixed_last"):
-                        tt = safe_int(route.get("taxi_time_min"), 0)
-                        total = max(safe_int(route.get("time_min"), 1), 1)
-                        st.write(f"택시 비중: {round(tt / total * 100)}%")
-
-                    st.write("세부 경로")
-                    for line in route.get("steps", [])[:12]:
-                        st.write(f"- {line}")
+            row2_col1, row2_col2 = st.columns(2)
+            with row2_col1:
+                if best_ml:
+                    render_route_card(best_ml, label="대중교통 → 택시")
+            with row2_col2:
+                if best_taxi:
+                    render_route_card(best_taxi, label="택시만")
 
             with st.expander("전체 후보 + 점수"):
-                all_sorted = sorted(all_candidates,
-                    key=lambda x: (value_score(x, all_candidates), x["cost"], x["time_min"]))
+                all_sorted = sorted(
+                    all_candidates,
+                    key=lambda x: (value_score(x, all_candidates), x["cost"], x["time_min"])
+                )
                 for i, c in enumerate(all_sorted, 1):
                     score = value_score(c, all_candidates)
                     est = " (추정)" if c.get("estimated") else ""
