@@ -47,51 +47,6 @@ st.markdown("""
     margin-bottom: 1.5rem;
 }
 
-/* 카드 공통 */
-.custom-card {
-    background: rgba(15, 23, 42, 0.78);
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    border-radius: 22px;
-    padding: 22px 24px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-    backdrop-filter: blur(10px);
-    margin-bottom: 18px;
-}
-
-/* 검색 요약 배지 */
-.badge {
-    display: inline-block;
-    padding: 6px 12px;
-    border-radius: 999px;
-    background: rgba(59, 130, 246, 0.15);
-    color: #93c5fd;
-    font-size: 0.85rem;
-    font-weight: 600;
-    margin-right: 8px;
-}
-
-/* metric 카드 느낌 */
-.metric-box {
-    background: rgba(2, 6, 23, 0.55);
-    border: 1px solid rgba(148, 163, 184, 0.10);
-    border-radius: 18px;
-    padding: 18px;
-    text-align: left;
-}
-
-.metric-label {
-    color: #94a3b8;
-    font-size: 0.92rem;
-    margin-bottom: 8px;
-}
-
-.metric-value {
-    font-size: 2.2rem;
-    font-weight: 800;
-    color: white;
-    letter-spacing: -0.03em;
-}
-
 /* 입력창 / 셀렉트 박스 */
 [data-testid="stTextInput"] input,
 [data-testid="stSelectbox"] > div,
@@ -121,7 +76,28 @@ st.markdown("""
     box-shadow: 0 12px 24px rgba(37, 99, 235, 0.35);
 }
 
-/* 구분선 약하게 */
+/* metric 카드 */
+div[data-testid="stMetric"] {
+    background: rgba(15, 23, 42, 0.78);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    padding: 18px;
+    border-radius: 18px;
+}
+
+/* alert 박스 */
+div[data-testid="stAlert"] {
+    border-radius: 16px;
+}
+
+/* expander */
+details {
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid rgba(148, 163, 184, 0.10);
+    border-radius: 16px;
+    padding: 6px 10px;
+}
+
+/* 구분선 */
 hr {
     border: none;
     border-top: 1px solid rgba(148, 163, 184, 0.15);
