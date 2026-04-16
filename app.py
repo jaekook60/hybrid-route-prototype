@@ -10,6 +10,125 @@ import streamlit as st
 
 st.set_page_config(page_title="혼합 경로 추천기", page_icon="🚌", layout="wide")
 
+import streamlit as st
+
+st.set_page_config(
+    page_title="혼합 경로 추천기",
+    page_icon="🛣️",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+/* 전체 배경 */
+.stApp {
+    background: linear-gradient(180deg, #07111f 0%, #0b1220 100%);
+    color: #f8fafc;
+}
+
+/* 기본 여백 */
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+    max-width: 1200px;
+}
+
+/* 타이틀 */
+.main-title {
+    font-size: 3rem;
+    font-weight: 800;
+    margin-bottom: 0.3rem;
+    letter-spacing: -0.02em;
+}
+
+.sub-title {
+    color: #94a3b8;
+    font-size: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+/* 카드 공통 */
+.custom-card {
+    background: rgba(15, 23, 42, 0.78);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 22px;
+    padding: 22px 24px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    backdrop-filter: blur(10px);
+    margin-bottom: 18px;
+}
+
+/* 검색 요약 배지 */
+.badge {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-right: 8px;
+}
+
+/* metric 카드 느낌 */
+.metric-box {
+    background: rgba(2, 6, 23, 0.55);
+    border: 1px solid rgba(148, 163, 184, 0.10);
+    border-radius: 18px;
+    padding: 18px;
+    text-align: left;
+}
+
+.metric-label {
+    color: #94a3b8;
+    font-size: 0.92rem;
+    margin-bottom: 8px;
+}
+
+.metric-value {
+    font-size: 2.2rem;
+    font-weight: 800;
+    color: white;
+    letter-spacing: -0.03em;
+}
+
+/* 입력창 / 셀렉트 박스 */
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] > div,
+[data-testid="stTimeInput"] input {
+    background-color: rgba(15, 23, 42, 0.95) !important;
+    border: 1px solid rgba(148, 163, 184, 0.15) !important;
+    border-radius: 14px !important;
+    color: white !important;
+}
+
+/* 버튼 */
+.stButton > button {
+    width: 100%;
+    height: 54px;
+    border: none;
+    border-radius: 16px;
+    color: white;
+    font-size: 1rem;
+    font-weight: 700;
+    background: linear-gradient(90deg, #2563eb 0%, #06b6d4 100%);
+    box-shadow: 0 8px 20px rgba(37, 99, 235, 0.28);
+    transition: all 0.2s ease;
+}
+
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 24px rgba(37, 99, 235, 0.35);
+}
+
+/* 구분선 약하게 */
+hr {
+    border: none;
+    border-top: 1px solid rgba(148, 163, 184, 0.15);
+    margin: 1.2rem 0;
+}
+</style>
+""", unsafe_allow_html=True)
 # =========================================================
 # 설정
 # =========================================================
@@ -1419,8 +1538,26 @@ def pick_best_by_kind(candidates, kind, priority, arrive_by=None):
 # =========================================================
 # UI
 # =========================================================
-st.title("혼합 경로 추천기")
-st.caption("대중교통 + 택시 혼합 · API 호출 최소화 버전")
+st.markdown('<div class="main-title">혼합 경로 추천기</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">대중교통 + 택시 조합으로 도착 시간과 비용을 함께 최적화</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="custom-card">', unsafe_allow_html=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    start = st.text_input("출발지", "명지대 자연")
+with col2:
+    end = st.text_input("목적지", "강남역")
+
+col3, col4 = st.columns(2)
+with col3:
+    arrive_time = st.text_input("도착 희망 시간", "12:30")
+with col4:
+    priority = st.selectbox("우선순위", ["가성비", "최단시간", "최소환승"])
+
+search = st.button("혼합 경로 검색")
+
+st.markdown('</div>', unsafe_allow_html=True)
 
 col_a, col_b = st.columns(2)
 with col_a:
